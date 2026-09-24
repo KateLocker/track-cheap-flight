@@ -27,6 +27,7 @@ export interface CronConfig {
 
 export interface AppConfig {
   kiwiApiKey: string;
+  serpApiKey: string;
   search: SearchConfig;
   email: EmailConfig;
   cron: CronConfig;
@@ -51,6 +52,7 @@ export function loadConfig(): AppConfig {
 
   return {
     kiwiApiKey: env.KIWI_API_KEY ?? "",
+    serpApiKey: env.SERPAPI_KEY ?? "",
     search: {
       flyFrom: env.FLY_FROM ?? "TYO",
       flyTo: env.FLY_TO ?? "DLC",
@@ -72,7 +74,7 @@ export function loadConfig(): AppConfig {
       alertPriceJPY: parseIntSafe(env.ALERT_PRICE_JPY, 70000) ?? 70000,
     },
     cron: {
-      schedule: env.CRON_SCHEDULE ?? "0 */4 * * *",
+      schedule: env.CRON_SCHEDULE ?? "0 0 * * *",
       timezone: env.CRON_TIMEZONE ?? "Asia/Tokyo",
     },
   };

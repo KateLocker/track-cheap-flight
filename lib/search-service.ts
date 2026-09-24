@@ -1,11 +1,18 @@
 import { loadConfig, AppConfig } from "./config";
 import {
-  searchRoundTripFlexible,
+  searchRoundTripFlexible as kiwiSearch,
   KiwiFlight,
-  getAirlineCodesFromFlight,
-  getFirstLegDeparture,
-  getReturnLegDeparture,
+  getAirlineCodesFromFlight as kiwiAirlines,
+  getFirstLegDeparture as kiwiFirstDep,
+  getReturnLegDeparture as kiwiReturnDep,
 } from "./kiwi-api";
+import {
+  searchRoundTripFlexible as serpSearch,
+  RoundTripSearchResult,
+  getAirlineCodesFromFlight as serpAirlines,
+  getFirstLegDeparture as serpFirstDep,
+  getReturnLegDeparture as serpReturnDep,
+} from "./google-flights-api";
 import {
   insertSearchRun,
   insertFlightRecord,
@@ -33,6 +40,63 @@ export function getAirlineName(code: string): string {
   return AIRLINE_NAMES[code] || code;
 }
 
+export interface UnifiedFlight {
+  id: string;
+  priceJPY: number;
+  currency: string;
+  flyFrom: string;
+  flyTo: string;
+  cityFrom: string;
+  cityTo: string;
+  airlineCode: string;
+  departureAt: string;
+  returnAt: string;
+  nightsInDest: number;
+  deep_link: string;
+  booking_token: string;
+  raw: unknown;
+}
+
+function unifyKiwi(f: KiwiFlight): UnifiedFlight {
+  const airlineCode = kiwiAirlines(f).split(",")[0] || f.airlines[0] || "?";
+  return {
+    id: f.id,
+    priceJPY: f.price,
+    currency: f.currency || "JPY",
+    flyFrom: f.flyFrom,
+    flyTo: f.flyTo,
+    cityFrom: f.cityFrom,
+    cityTo: f.cityTo,
+    airlineCode,
+    departureAt: kiwiFirstDep(f),
+    returnAt: kiwiReturnDep(f),
+    nightsInDest: f.nightsInDest || 0,
+    deep_link: f.deep_link || "",
+    booking_token: f.booking_token || "",
+    raw: { id: f.id, route: f.route.slice(0, 8) },
+  };
+}
+
+function unifySerp(f: RoundTripSearchResult): UnifiedFlight {
+  const airlineCode = serpAirlines(f).split(",")[0] || f.airlines[0] || "?";
+  return {
+    id: f.id,
+    priceJPY: f.price,
+    currency: f.currency || "JPY",
+    flyFrom: f.flyFrom,
+    flyTo: f.flyTo,
+    cityFrom: f.cityFrom,
+    cityTo: f.cityTo,
+    airlineCode,
+    departureAt: serpFirstDep(f),
+    returnAt: serpReturnDep(f),
+    nightsInDest: f.nightsInDest || 0,
+    deep_link: f.deep_link || "",
+    booking_token: f.booking_token || "",
+    raw: f.route,
+  };
+}
+
 export interface SearchResult {
   success: boolean;
   error?: string;
@@ -43,28 +107,40 @@ export interface SearchResult {
   previousLowest: number | null;
   emailSent: boolean;
   emailError?: string;
+  provider?: "kiwi" | "serpapi" | "none";
 }
 
 export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
   const config = cfg ?? loadConfig();
   const startedAt = new Date().toISOString();
 
-  let kiwiFlights: KiwiFlight[] = [];
+  let flights: UnifiedFlight[] = [];
   let errorMsg: string | null = null;
+  let provider: "kiwi" | "serpapi" | "none" = "none";
 
-  if (!config.kiwiApiKey || config.kiwiApiKey.includes("your_kiwi")) {
-    errorMsg = "KIWI_API_KEY が未設定です。.env に Tequila API Key を設定してください。";
-  } else {
+  const useSerpapi = !!config.serpApiKey && config.serpApiKey.length > 5;
+  const useKiwi = !useSerpapi && !!config.kiwiApiKey && !config.kiwiApiKey.includes("your_kiwi");
+
+  if (useSerpapi) {
+    provider = "serpapi";
     try {
-      kiwiFlights = await searchRoundTripFlexible(config.kiwiApiKey, config.search);
+      const results = await serpSearch(config.serpApiKey, config.search);
+      flights = results.map(unifySerp).sort((a, b) => a.priceJPY - b.priceJPY);
     } catch (err: unknown) {
       errorMsg = err instanceof Error ? err.message : String(err);
     }
+  } else if (useKiwi) {
+    provider = "kiwi";
+    try {
+      const results = await kiwiSearch(config.kiwiApiKey, config.search);
+      flights = results.map(unifyKiwi).sort((a, b) => a.priceJPY - b.priceJPY);
+    } catch (err: unknown) {
+      errorMsg = err instanceof Error ? err.message : String(err);
+    }
+  } else {
+    errorMsg =
+      "SERPAPI_KEY / KIWI_API_KEY が未設定です。Vercel の Environment Variables に、SerpAPI または Kiwi Tequila の API Key を設定してください。";
   }
-
-  const jpyFlights = kiwiFlights
-    .map((f) => ({ ...f, priceJPY: f.price }))
-    .sort((a, b) => a.priceJPY - b.priceJPY);
 
   const savedRecordIds: number[] = [];
   let minPrice: number | null = null;
@@ -72,35 +148,31 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
   const searchRunId = insertSearchRun({
     started_at: startedAt,
     finished_at: new Date().toISOString(),
-    flights_found: jpyFlights.length,
-    min_price: jpyFlights[0]?.priceJPY ?? null,
-    status: errorMsg ? (jpyFlights.length > 0 ? "partial" : "failed") : "success",
+    flights_found: flights.length,
+    min_price: flights[0]?.priceJPY ?? null,
+    status: errorMsg ? (flights.length > 0 ? "partial" : "failed") : "success",
     error_message: errorMsg,
   });
 
-  for (const f of jpyFlights) {
-    const airlineCode = getAirlineCodesFromFlight(f).split(",")[0] || f.airlines[0] || "?";
-    const departureAt = getFirstLegDeparture(f);
-    const returnAt = getReturnLegDeparture(f);
+  for (const f of flights) {
     const price = f.priceJPY;
-
     if (minPrice == null || price < minPrice) minPrice = price;
 
     try {
       const id = insertFlightRecord({
         search_run_id: searchRunId,
         price,
-        currency: "JPY",
+        currency: f.currency || "JPY",
         fly_from: config.search.flyFrom,
         fly_to: config.search.flyTo,
-        airline: airlineCode,
-        airline_name: getAirlineName(airlineCode),
-        departure_at: departureAt,
-        return_at: returnAt,
+        airline: f.airlineCode,
+        airline_name: getAirlineName(f.airlineCode),
+        departure_at: f.departureAt,
+        return_at: f.returnAt,
         nights_in_dest: f.nightsInDest || 0,
         booking_token: f.booking_token || "",
         deep_link: f.deep_link || "",
-        raw_data: JSON.stringify({ id: f.id, route: f.route.slice(0, 8) }),
+        raw_data: typeof f.raw === "string" ? f.raw : JSON.stringify(f.raw).slice(0, 8000),
       });
       savedRecordIds.push(id);
     } catch (e) {
@@ -108,29 +180,27 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
     }
   }
 
-  const cheapestJPY = jpyFlights[0]?.priceJPY;
+  const cheapest = flights[0];
   let lowestFlight: FlightRecord | null = null;
   let isNewLowest = false;
   let previousLowest: number | null = null;
   let emailSent = false;
   let emailError: string | undefined = undefined;
 
-  if (cheapestJPY != null && savedRecordIds.length > 0) {
-    const cheapestRaw = jpyFlights[0];
-    const airlineCode = getAirlineCodesFromFlight(cheapestRaw).split(",")[0] || cheapestRaw.airlines[0] || "?";
+  if (cheapest != null && savedRecordIds.length > 0) {
     lowestFlight = {
       search_run_id: searchRunId,
-      price: cheapestJPY,
-      currency: "JPY",
+      price: cheapest.priceJPY,
+      currency: cheapest.currency || "JPY",
       fly_from: config.search.flyFrom,
       fly_to: config.search.flyTo,
-      airline: airlineCode,
-      airline_name: getAirlineName(airlineCode),
-      departure_at: getFirstLegDeparture(cheapestRaw),
-      return_at: getReturnLegDeparture(cheapestRaw),
-      nights_in_dest: cheapestRaw.nightsInDest || 0,
-      booking_token: cheapestRaw.booking_token || "",
-      deep_link: cheapestRaw.deep_link || "",
+      airline: cheapest.airlineCode,
+      airline_name: getAirlineName(cheapest.airlineCode),
+      departure_at: cheapest.departureAt,
+      return_at: cheapest.returnAt,
+      nights_in_dest: cheapest.nightsInDest || 0,
+      booking_token: cheapest.booking_token || "",
+      deep_link: cheapest.deep_link || "",
       raw_data: "",
       id: savedRecordIds[0],
       created_at: new Date().toISOString(),
@@ -138,22 +208,22 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
 
     const existing = getLatestLowestPrice(config.search.flyFrom, config.search.flyTo);
     previousLowest = existing?.min_price ?? null;
-    isNewLowest = !existing || cheapestJPY < existing.min_price;
+    isNewLowest = !existing || cheapest.priceJPY < existing.min_price;
 
     upsertLowestPrice({
       fly_from: config.search.flyFrom,
       fly_to: config.search.flyTo,
-      min_price: cheapestJPY,
-      currency: "JPY",
-      airline: airlineCode,
-      departure_at: getFirstLegDeparture(cheapestRaw),
-      return_at: getReturnLegDeparture(cheapestRaw),
-      nights_in_dest: cheapestRaw.nightsInDest || 0,
-      deep_link: cheapestRaw.deep_link || "",
+      min_price: cheapest.priceJPY,
+      currency: cheapest.currency || "JPY",
+      airline: cheapest.airlineCode,
+      departure_at: cheapest.departureAt,
+      return_at: cheapest.returnAt,
+      nights_in_dest: cheapest.nightsInDest || 0,
+      deep_link: cheapest.deep_link || "",
       flight_record_id: savedRecordIds[0],
     });
 
-    const needAlertByThreshold = cheapestJPY <= config.email.alertPriceJPY;
+    const needAlertByThreshold = cheapest.priceJPY <= config.email.alertPriceJPY;
     const needAlertByNewLow = isNewLowest && config.email.enabled;
 
     if (lowestFlight && (needAlertByThreshold || needAlertByNewLow) && config.email.enabled) {
@@ -184,14 +254,15 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
   }
 
   return {
-    success: !errorMsg || jpyFlights.length > 0,
+    success: !errorMsg || flights.length > 0,
     error: errorMsg ?? undefined,
-    flightsFound: jpyFlights.length,
+    flightsFound: flights.length,
     minPrice,
     lowestFlight,
     isNewLowest,
     previousLowest,
     emailSent,
     emailError,
+    provider,
   };
 }
