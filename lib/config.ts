@@ -30,6 +30,7 @@ export interface AppConfig {
   serpApiKey: string;
   amadeusClientId: string;
   amadeusClientSecret: string;
+  rapidapiKey: string;
   search: SearchConfig;
   email: EmailConfig;
   cron: CronConfig;
@@ -57,6 +58,7 @@ export function loadConfig(): AppConfig {
     serpApiKey: env.SERPAPI_KEY ?? "",
     amadeusClientId: env.AMADEUS_CLIENT_ID ?? "",
     amadeusClientSecret: env.AMADEUS_CLIENT_SECRET ?? "",
+    rapidapiKey: env.RAPIDAPI_KEY ?? "",
     search: {
       flyFrom: env.FLY_FROM ?? "TYO",
       flyTo: env.FLY_TO ?? "DLC",

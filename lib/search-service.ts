@@ -18,6 +18,10 @@ import {
   AmadeusRoundTrip,
 } from "./amadeus-api";
 import {
+  searchRoundTripFlexible as skySearch,
+  SkyscannerRoundTrip,
+} from "./skyscanner-api";
+import {
   insertSearchRun,
   insertFlightRecord,
   getLatestLowestPrice,
@@ -127,6 +131,27 @@ function unifyAmadeus(f: AmadeusRoundTrip): UnifiedFlight {
   };
 }
 
+function unifySky(f: SkyscannerRoundTrip): UnifiedFlight {
+  const airlineCode = f.airlines[0] || "?";
+  return {
+    id: `sky-${f.id}`,
+    priceJPY: f.price,
+    currency: f.currency || "JPY",
+    flyFrom: f.flyFrom,
+    flyTo: f.flyTo,
+    cityFrom: f.cityFrom,
+    cityTo: f.cityTo,
+    airlineCode,
+    departureAt: f.local_departure,
+    returnAt: f.return_departure,
+    nightsInDest: f.nightsInDest || 0,
+    deep_link: f.deep_link || "",
+    booking_token: f.booking_token || "",
+    raw: (f.route || []).slice(0, 10),
+    source: "skyscanner",
+  };
+}
+
 export type SearchMode = "full" | "light";
 
 export interface SearchResult {
@@ -139,7 +164,7 @@ export interface SearchResult {
   previousLowest: number | null;
   emailSent: boolean;
   emailError?: string;
-  provider?: "kiwi" | "serpapi" | "amadeus" | "mixed" | "none";
+  provider?: "kiwi" | "serpapi" | "amadeus" | "skyscanner" | "mixed" | "none";
   mode?: SearchMode;
 }
 
@@ -193,6 +218,22 @@ async function collectAmadeus(
   }
 }
 
+async function collectSky(
+  cfg: AppConfig,
+  flights: UnifiedFlight[],
+  errors: string[]
+) {
+  if (!cfg.rapidapiKey) return;
+  try {
+    const r = await skySearch(cfg.rapidapiKey, cfg.search);
+    for (const f of r) flights.push(unifySky(f));
+  } catch (e) {
+    errors.push(
+      `Skyscanner(Rapid): ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+}
+
 export async function runFullSearch(
   cfg?: AppConfig,
   mode: SearchMode = "full"
@@ -202,18 +243,32 @@ export async function runFullSearch(
 
   const flights: UnifiedFlight[] = [];
   const errors: string[] = [];
-  const providerSet = new Set<"kiwi" | "serpapi" | "amadeus">();
+  const providerSet = new Set<
+    "kiwi" | "serpapi" | "amadeus" | "skyscanner"
+  >();
 
   const useSerp = !!config.serpApiKey && config.serpApiKey.length > 5;
+  const useSky = !!config.rapidapiKey && config.rapidapiKey.length > 5;
   const useAmadeus =
     !!config.amadeusClientId && !!config.amadeusClientSecret;
   const useKiwi =
     !!config.kiwiApiKey && !config.kiwiApiKey.includes("your_kiwi");
 
   try {
-    if (useSerp) {
+    if (useSky) {
+      await collectSky(config, flights, errors);
+      if (flights.some((f) => f.source === "skyscanner"))
+        providerSet.add("skyscanner");
+    }
+  } catch {
+    /* ignore outer */
+  }
+
+  try {
+    if (useSerp && flights.length < 15) {
       await collectSerp(config, flights, errors);
-      if (flights.length > 0) providerSet.add("serpapi");
+      if (flights.some((f) => f.source === "serpapi"))
+        providerSet.add("serpapi");
     }
   } catch {
     /* ignore outer */
@@ -252,10 +307,11 @@ export async function runFullSearch(
     flights.length === 0 &&
     !useSerp &&
     !useKiwi &&
-    !useAmadeus
+    !useAmadeus &&
+    !useSky
   ) {
     combinedErr =
-      "SERPAPI_KEY / KIWI_API_KEY / AMADEUS_CLIENT_ID + AMADEUS_CLIENT_SECRET のいずれかを Vercel Environment Variables に設定してください。";
+      "RAPIDAPI_KEY / SERPAPI_KEY / KIWI_API_KEY / AMADEUS_CLIENT_ID+SECRET のいずれかを Vercel Environment Variables に設定してください。";
   } else if (flights.length === 0) {
     if (errors.length > 0) combinedErr = errors.join(" | ").slice(0, 900);
   }
