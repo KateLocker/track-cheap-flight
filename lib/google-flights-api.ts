@@ -191,40 +191,78 @@ export async function searchRoundTripFlexible(
     cur = addDays(cur, stepDays + 1);
   }
 
+  const fromCandidates: string[] = [];
+  const toCandidates: string[] = [];
+  const fromUpper = config.flyFrom.toUpperCase();
+  const toUpper = config.flyTo.toUpperCase();
+  fromCandidates.push(fromUpper);
+  toCandidates.push(toUpper);
+  const cityExpansions: Record<string, string[]> = {
+    TYO: ["NRT", "HND"],
+    SFO: ["SFO", "OAK", "SJC"],
+    NYC: ["JFK", "LGA", "EWR"],
+    LAX: ["LAX", "LGB", "BUR"],
+    CHI: ["ORD", "MDW"],
+    WAS: ["IAD", "DCA"],
+    PAR: ["CDG", "ORY"],
+    LON: ["LHR", "LGW", "STN"],
+    SEL: ["ICN", "GMP"],
+    SHA: ["PVG", "SHA", "PVG"],
+    SPK: ["CTS", "SPK"],
+    OSA: ["KIX", "ITM"],
+  };
+  for (const c of cityExpansions[fromUpper] || []) {
+    if (!fromCandidates.includes(c)) fromCandidates.push(c);
+  }
+  for (const c of cityExpansions[toUpper] || []) {
+    if (!toCandidates.includes(c)) toCandidates.push(c);
+  }
+
   const pool: RoundTripSearchResult[] = [];
   const seenKeys = new Set<string>();
 
   for (let wIdx = 0; wIdx < Math.min(windows.length, 5); wIdx++) {
     const w = windows[wIdx];
     try {
-      let outbounds = await searchGoogleFlightsOneWay({
-        api_key: apiKey,
-        departure_id: config.flyFrom,
-        arrival_id: config.flyTo,
-        outbound_date_start: w.start,
-        outbound_date_end: w.end,
-        airlineCodes: config.selectAirlines,
-        maxPrice: config.maxPriceJPY ?? undefined,
-        adults: config.adults,
-        currency: "JPY",
-        hl: "ja",
-      });
-
-      if (
-        outbounds.length === 0 &&
-        config.selectAirlines.length > 0
-      ) {
-        outbounds = await searchGoogleFlightsOneWay({
-          api_key: apiKey,
-          departure_id: config.flyFrom,
-          arrival_id: config.flyTo,
-          outbound_date_start: w.start,
-          outbound_date_end: w.end,
-          maxPrice: config.maxPriceJPY ?? undefined,
-          adults: config.adults,
-          currency: "JPY",
-          hl: "ja",
-        });
+      let outbounds: GFlightsOption[] = [];
+      for (const fCode of fromCandidates) {
+        for (const tCode of toCandidates) {
+          try {
+            let outs = await searchGoogleFlightsOneWay({
+              api_key: apiKey,
+              departure_id: fCode,
+              arrival_id: tCode,
+              outbound_date_start: w.start,
+              outbound_date_end: w.end,
+              airlineCodes:
+                config.selectAirlines.length > 0
+                  ? config.selectAirlines
+                  : undefined,
+              maxPrice: config.maxPriceJPY ?? undefined,
+              adults: config.adults,
+              currency: "JPY",
+              hl: "ja",
+            });
+            if (outs.length === 0 && config.selectAirlines.length > 0) {
+              outs = await searchGoogleFlightsOneWay({
+                api_key: apiKey,
+                departure_id: fCode,
+                arrival_id: tCode,
+                outbound_date_start: w.start,
+                outbound_date_end: w.end,
+                maxPrice: config.maxPriceJPY ?? undefined,
+                adults: config.adults,
+                currency: "JPY",
+                hl: "ja",
+              });
+            }
+            if (outs.length > 0) outbounds.push(...outs);
+            if (outbounds.length >= 20) break;
+          } catch {
+            /* ignore per city-pair error */
+          }
+        }
+        if (outbounds.length >= 20) break;
       }
 
       if (outbounds.length === 0) continue;
@@ -249,38 +287,49 @@ export async function searchRoundTripFlexible(
         const returnWindowEnd =
           returnEnd < windowEnd ? returnEnd : windowEnd;
 
-        let returns = await searchGoogleFlightsOneWay({
-          api_key: apiKey,
-          departure_id: config.flyTo,
-          arrival_id: config.flyFrom,
-          outbound_date_start: returnStart,
-          outbound_date_end: returnWindowEnd,
-          airlineCodes: config.selectAirlines,
-          maxPrice: config.maxPriceJPY
-            ? config.maxPriceJPY - out.price
-            : undefined,
-          adults: config.adults,
-          currency: "JPY",
-          hl: "ja",
-        });
-
-        if (
-          returns.length === 0 &&
-          config.selectAirlines.length > 0
-        ) {
-          returns = await searchGoogleFlightsOneWay({
-            api_key: apiKey,
-            departure_id: config.flyTo,
-            arrival_id: config.flyFrom,
-            outbound_date_start: returnStart,
-            outbound_date_end: returnWindowEnd,
-            maxPrice: config.maxPriceJPY
-              ? config.maxPriceJPY - out.price
-              : undefined,
-            adults: config.adults,
-            currency: "JPY",
-            hl: "ja",
-          });
+        let returns: GFlightsOption[] = [];
+        for (const rFrom of toCandidates) {
+          for (const rTo of fromCandidates) {
+            try {
+              let r = await searchGoogleFlightsOneWay({
+                api_key: apiKey,
+                departure_id: rFrom,
+                arrival_id: rTo,
+                outbound_date_start: returnStart,
+                outbound_date_end: returnWindowEnd,
+                airlineCodes:
+                  config.selectAirlines.length > 0
+                    ? config.selectAirlines
+                    : undefined,
+                maxPrice: config.maxPriceJPY
+                  ? config.maxPriceJPY - out.price
+                  : undefined,
+                adults: config.adults,
+                currency: "JPY",
+                hl: "ja",
+              });
+              if (r.length === 0 && config.selectAirlines.length > 0) {
+                r = await searchGoogleFlightsOneWay({
+                  api_key: apiKey,
+                  departure_id: rFrom,
+                  arrival_id: rTo,
+                  outbound_date_start: returnStart,
+                  outbound_date_end: returnWindowEnd,
+                  maxPrice: config.maxPriceJPY
+                    ? config.maxPriceJPY - out.price
+                    : undefined,
+                  adults: config.adults,
+                  currency: "JPY",
+                  hl: "ja",
+                });
+              }
+              if (r.length > 0) returns.push(...r);
+              if (returns.length >= 20) break;
+            } catch {
+              /* ignore */
+            }
+          }
+          if (returns.length >= 20) break;
         }
 
         for (let j = 0; j < Math.min(returns.length, 10); j++) {

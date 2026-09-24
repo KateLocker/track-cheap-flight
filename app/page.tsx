@@ -96,6 +96,34 @@ const DEFAULT_SEARCH: SearchParams = {
   alertPriceJPY: 70000,
 };
 
+const PARAMS_KEY = "track-cheap-flight.search-params.v1";
+
+function loadStoredParams(): SearchParams {
+  if (typeof window === "undefined") return DEFAULT_SEARCH;
+  try {
+    const raw = window.localStorage.getItem(PARAMS_KEY);
+    if (!raw) return DEFAULT_SEARCH;
+    const p = JSON.parse(raw);
+    return {
+      flyFrom: String(p.flyFrom || DEFAULT_SEARCH.flyFrom).toUpperCase(),
+      flyTo: String(p.flyTo || DEFAULT_SEARCH.flyTo).toUpperCase(),
+      searchDaysAhead: toIntOr(
+        String(p.searchDaysAhead),
+        DEFAULT_SEARCH.searchDaysAhead
+      ),
+      minNights: toIntOr(String(p.minNights), DEFAULT_SEARCH.minNights),
+      maxNights: toIntOr(String(p.maxNights), DEFAULT_SEARCH.maxNights),
+      selectAirlines: p.selectAirlines || DEFAULT_SEARCH.selectAirlines,
+      alertPriceJPY: toIntOr(
+        String(p.alertPriceJPY),
+        DEFAULT_SEARCH.alertPriceJPY
+      ),
+    };
+  } catch {
+    return DEFAULT_SEARCH;
+  }
+}
+
 const AIRLINE_OPTIONS = [
   { code: "NH", name: "全日空 ANA" },
   { code: "JL", name: "日本航空 JAL" },
@@ -167,27 +195,44 @@ export default function HomePage() {
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
   const [sendingTest, setSendingTest] = useState(false);
   const [testMsg, setTestMsg] = useState<string | null>(null);
-  const [params, setParams] = useState<SearchParams>(DEFAULT_SEARCH);
+  const [params, setParams] = useState<SearchParams>(() => loadStoredParams());
+  const [paramsLoaded, setParamsLoaded] = useState(false);
 
-  const load = async () => {
+  const persistParams = (next: SearchParams) => {
+    setParams(next);
+    try {
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(PARAMS_KEY, JSON.stringify(next));
+      }
+    } catch {}
+  };
+
+  const load = async ({ keepParams = true } = {}) => {
     setLoading(true);
     try {
       const r = await fetch("/api/dashboard", { cache: "no-store" });
       const json = (await r.json()) as DashboardData;
       setData(json);
-      if (json?.config) {
-        setParams({
-          flyFrom: json.config.flyFrom || DEFAULT_SEARCH.flyFrom,
-          flyTo: json.config.flyTo || DEFAULT_SEARCH.flyTo,
-          searchDaysAhead:
-            json.config.searchDaysAhead || DEFAULT_SEARCH.searchDaysAhead,
-          minNights: json.config.minNights ?? DEFAULT_SEARCH.minNights,
-          maxNights: json.config.maxNights ?? DEFAULT_SEARCH.maxNights,
-          selectAirlines: (json.config.selectAirlines || []).join(",") ||
-            DEFAULT_SEARCH.selectAirlines,
-          alertPriceJPY:
-            json.config.alertPrice || DEFAULT_SEARCH.alertPriceJPY,
-        });
+      if (!keepParams || !paramsLoaded) {
+        const fallbackParams = paramsLoaded
+          ? params
+          : {
+              flyFrom: json?.config?.flyFrom || DEFAULT_SEARCH.flyFrom,
+              flyTo: json?.config?.flyTo || DEFAULT_SEARCH.flyTo,
+              searchDaysAhead:
+                json?.config?.searchDaysAhead || DEFAULT_SEARCH.searchDaysAhead,
+              minNights: json?.config?.minNights ?? DEFAULT_SEARCH.minNights,
+              maxNights: json?.config?.maxNights ?? DEFAULT_SEARCH.maxNights,
+              selectAirlines:
+                (json?.config?.selectAirlines || []).join(",") ||
+                DEFAULT_SEARCH.selectAirlines,
+              alertPriceJPY:
+                json?.config?.alertPrice || DEFAULT_SEARCH.alertPriceJPY,
+            };
+        if (!paramsLoaded) {
+          setParams(fallbackParams);
+          setParamsLoaded(true);
+        }
       }
     } finally {
       setLoading(false);
@@ -195,36 +240,56 @@ export default function HomePage() {
   };
 
   useEffect(() => {
-    load();
+    load({ keepParams: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const runSearch = async () => {
     setSearching(true);
     setSearchResult(null);
+    const originalParams = { ...params };
     try {
       const r = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          flyFrom: params.flyFrom.trim().toUpperCase(),
-          flyTo: params.flyTo.trim().toUpperCase(),
+          flyFrom: originalParams.flyFrom.trim().toUpperCase(),
+          flyTo: originalParams.flyTo.trim().toUpperCase(),
           searchDaysAhead: toIntOr(
-            String(params.searchDaysAhead),
+            String(originalParams.searchDaysAhead),
             DEFAULT_SEARCH.searchDaysAhead
           ),
-          minNights: toIntOr(String(params.minNights), DEFAULT_SEARCH.minNights),
-          maxNights: toIntOr(String(params.maxNights), DEFAULT_SEARCH.maxNights),
-          selectAirlines: params.selectAirlines,
+          minNights: toIntOr(
+            String(originalParams.minNights),
+            DEFAULT_SEARCH.minNights
+          ),
+          maxNights: toIntOr(
+            String(originalParams.maxNights),
+            DEFAULT_SEARCH.maxNights
+          ),
+          selectAirlines: originalParams.selectAirlines,
           alertPriceJPY: toIntOr(
-            String(params.alertPriceJPY),
+            String(originalParams.alertPriceJPY),
             DEFAULT_SEARCH.alertPriceJPY
           ),
         }),
       });
       const json = (await r.json()) as SearchResult;
       setSearchResult(json);
-      await load();
+      await load({ keepParams: true });
+      persistParams(originalParams);
+    } catch (e) {
+      setSearchResult({
+        success: false,
+        error: e instanceof Error ? e.message : String(e),
+        flightsFound: 0,
+        minPrice: null,
+        isNewLowest: false,
+        previousLowest: null,
+        emailSent: false,
+      });
     } finally {
+      persistParams(originalParams);
       setSearching(false);
     }
   };
@@ -275,7 +340,8 @@ export default function HomePage() {
   const update = (key: keyof SearchParams) => (
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
   ) => {
-    setParams((prev) => ({ ...prev, [key]: e.target.value }));
+    const next = { ...params, [key]: e.target.value };
+    persistParams(next);
   };
 
   return (
