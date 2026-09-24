@@ -28,11 +28,14 @@ export interface SerpSearchParams {
   arrival_id: string;
   outbound_date_start: Date;
   outbound_date_end: Date;
+  outbound_date_specific?: Date;
+  return_date_specific?: Date;
   airlineCodes?: string[];
   maxPrice?: number;
   adults?: number;
   currency?: string;
   hl?: string;
+  travelType?: "one_way" | "round_trip";
 }
 
 const SERPAPI_BASE = "https://serpapi.com";
@@ -47,88 +50,129 @@ function dateRangeToStr(start: Date, end: Date): string {
 export async function searchGoogleFlightsOneWay(
   params: SerpSearchParams
 ): Promise<GFlightsOption[]> {
-  const queryParams: Record<string, unknown> = {
-    engine: "google_flights",
-    api_key: params.api_key,
-    departure_id: params.departure_id,
-    arrival_id: params.arrival_id,
-    outbound_date: dateRangeToStr(
-      params.outbound_date_start,
-      params.outbound_date_end
-    ),
-    currency: params.currency ?? "JPY",
-    hl: params.hl ?? "ja",
-    adults: params.adults ?? 1,
-  };
-
-  if (params.airlineCodes && params.airlineCodes.length > 0) {
-    queryParams.airline_codes = params.airlineCodes.join(",");
-  }
-  if (params.maxPrice && params.maxPrice > 0) {
-    queryParams.max_price = params.maxPrice;
-  }
-
-  try {
-    const resp = await axios.get(SERPAPI_BASE + "/search", {
-      params: queryParams,
-      timeout: 90_000,
-    });
-    const data = resp.data as {
-      best_flights?: Array<{
-        flights: GFlightsSegment[][];
-        price: number;
-        type?: string;
-        deep_link?: string;
-        total_duration?: number;
-        layovers?: number;
-      }>;
-      other_flights?: Array<{
-        flights: GFlightsSegment[][];
-        price: number;
-        deep_link?: string;
-        total_duration?: number;
-        layovers?: number;
-      }>;
-      price_insights?: { lowest_price?: number; typical_price?: number; price_level?: string };
-      search_metadata?: unknown;
-      search_parameters?: unknown;
-    };
-
-    const out: GFlightsOption[] = [];
-    const push = (
-      list:
-        | Array<{
-            flights: GFlightsSegment[][];
-            price: number;
-            deep_link?: string;
-            total_duration?: number;
-            layovers?: number;
-          }>
-        | undefined
-    ) => {
-      if (!list) return;
-      for (const item of list) {
-        if (!item || !item.flights || !item.price) continue;
-        out.push({
-          price: item.price,
-          flights: item.flights,
-          deep_link: item.deep_link,
-          total_duration: item.total_duration,
-          layovers: item.layovers,
-        });
-      }
-    };
-    push(data.best_flights);
-    push(data.other_flights);
-    return out;
-  } catch (err: unknown) {
-    if (axios.isAxiosError(err) && err.response) {
-      const status = err.response.status;
-      const body = JSON.stringify(err.response.data);
-      throw new Error(`SerpAPI HTTP ${status}: ${body.slice(0, 600)}`);
+  const all: GFlightsOption[] = [];
+  const tryDates: Date[] = [];
+  if (params.outbound_date_specific) {
+    tryDates.push(new Date(params.outbound_date_specific));
+  } else {
+    const start = new Date(params.outbound_date_start);
+    const end = new Date(params.outbound_date_end);
+    const days = Math.max(
+      1,
+      Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24))
+    );
+    let step = 1;
+    if (days > 21) step = 3;
+    if (days > 60) step = 5;
+    if (days > 120) step = 7;
+    for (
+      let d = new Date(start), i = 0;
+      d <= end && i < Math.min(10, Math.ceil(days / step));
+      d = addDays(d, step), i++
+    ) {
+      tryDates.push(new Date(d));
     }
-    throw err;
   }
+
+  const maxCallsPerInvoke = 10;
+  for (let idx = 0; idx < Math.min(maxCallsPerInvoke, tryDates.length); idx++) {
+    const d = tryDates[idx];
+
+    const queryParams: Record<string, unknown> = {
+      engine: "google_flights",
+      api_key: params.api_key,
+      departure_id: params.departure_id,
+      arrival_id: params.arrival_id,
+      outbound_date: format(d, "yyyy-MM-dd"),
+      currency: params.currency ?? "JPY",
+      hl: params.hl ?? "ja",
+      adults: params.adults ?? 1,
+      type: "2",
+    };
+
+    if (params.return_date_specific) {
+      queryParams.return_date = format(params.return_date_specific, "yyyy-MM-dd");
+      queryParams.type = "1";
+    }
+    if (params.airlineCodes && params.airlineCodes.length > 0) {
+      queryParams.airline_codes = params.airlineCodes.join(",");
+    }
+    if (params.maxPrice && params.maxPrice > 0) {
+      queryParams.max_price = params.maxPrice;
+    }
+
+    try {
+      const resp = await axios.get(SERPAPI_BASE + "/search", {
+        params: queryParams,
+        timeout: 90_000,
+      });
+      const data = resp.data as {
+        best_flights?: Array<{
+          flights: GFlightsSegment[][];
+          price: number;
+          type?: string;
+          deep_link?: string;
+          total_duration?: number;
+          layovers?: number;
+          departure_token?: string;
+          booking_token?: string;
+        }>;
+        other_flights?: Array<{
+          flights: GFlightsSegment[][];
+          price: number;
+          deep_link?: string;
+          total_duration?: number;
+          layovers?: number;
+          departure_token?: string;
+          booking_token?: string;
+        }>;
+        price_insights?: { lowest_price?: number; typical_price?: number; price_level?: string };
+        search_metadata?: unknown;
+        search_parameters?: unknown;
+      };
+
+      const out: GFlightsOption[] = [];
+      const push = (
+        list:
+          | Array<{
+              flights: GFlightsSegment[][];
+              price: number;
+              deep_link?: string;
+              total_duration?: number;
+              layovers?: number;
+              departure_token?: string;
+              booking_token?: string;
+            }>
+          | undefined
+      ) => {
+        if (!list) return;
+        for (const item of list) {
+          if (!item || !item.flights || !item.price) continue;
+          out.push({
+            price: item.price,
+            flights: item.flights,
+            deep_link: item.deep_link,
+            total_duration: item.total_duration,
+            layovers: item.layovers,
+            departure_token: item.departure_token,
+            booking_token: item.booking_token,
+          });
+        }
+      };
+      push(data.best_flights);
+      push(data.other_flights);
+      for (const o of out) all.push(o);
+      if (all.length >= 15) break;
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err) && err.response) {
+        const status = err.response.status;
+        const body = JSON.stringify(err.response.data);
+        throw new Error(`SerpAPI HTTP ${status}: ${body.slice(0, 600)}`);
+      }
+      // continue with next day
+    }
+  }
+  return all;
 }
 
 export interface RoundTripSearchResult {
