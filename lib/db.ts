@@ -88,9 +88,9 @@ function getDataDir(): string {
   const dir =
     (process.env.DATA_DIR as string | undefined) ||
     path.resolve(process.cwd(), "data");
-  if (!fs.existsSync(dir)) {
+  if (!fs.existsSync(/*turbopackIgnore: true*/ dir)) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(/*turbopackIgnore: true*/ dir, { recursive: true });
     } catch {
       // 只读文件系统下忽略
     }
@@ -105,7 +105,8 @@ function getDataPath(): string {
 function canWriteFile(p: string): boolean {
   try {
     fs.accessSync(path.dirname(p), fs.constants.W_OK);
-    if (fs.existsSync(p)) fs.accessSync(p, fs.constants.W_OK);
+    if (fs.existsSync(/*turbopackIgnore: true*/ p))
+      fs.accessSync(/*turbopackIgnore: true*/ p, fs.constants.W_OK);
     return true;
   } catch {
     return false;
@@ -116,7 +117,7 @@ function loadStore(): DataStore {
   const p = getDataPath();
   if (storeCache && storeCachePath === p) return storeCache;
   try {
-    if (fs.existsSync(p)) {
+    if (fs.existsSync(/*turbopackIgnore: true*/ p)) {
       const raw = fs.readFileSync(p, "utf-8");
       const parsed = JSON.parse(raw) as DataStore;
       storeCache = { ...EMPTY_STORE, ...parsed, nextId: { ...EMPTY_STORE.nextId, ...(parsed.nextId || {}) } };
