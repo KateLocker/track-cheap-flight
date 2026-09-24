@@ -20,7 +20,7 @@ export async function GET(req: Request) {
   }
 
   const cfg = loadConfig();
-  const result = await runFullSearch(cfg);
+  const result = await runFullSearch(cfg, "light");
 
   return NextResponse.json({
     ok: result.success,

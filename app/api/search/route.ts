@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { runFullSearch } from "@/lib/search-service";
-import { loadConfig } from "@/lib/config";
-import type { SearchConfig } from "@/lib/config";
+import { loadConfig, SearchConfig } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,14 +26,17 @@ export async function POST(request: Request) {
       selectAirlines: string | string[];
       maxPriceJPY: number | string;
       alertPriceJPY: number | string;
+      mode: "light" | "full";
     }> = {};
     try {
       body = (await request.json()) ?? {};
     } catch {}
 
     const overrideSearch: Partial<SearchConfig> = {};
-    if (body.flyFrom) overrideSearch.flyFrom = String(body.flyFrom).toUpperCase();
-    if (body.flyTo) overrideSearch.flyTo = String(body.flyTo).toUpperCase();
+    if (body.flyFrom)
+      overrideSearch.flyFrom = String(body.flyFrom).toUpperCase();
+    if (body.flyTo)
+      overrideSearch.flyTo = String(body.flyTo).toUpperCase();
     if (body.searchDaysAhead != null) {
       const v = parseInt(String(body.searchDaysAhead), 10);
       if (Number.isFinite(v) && v > 0) overrideSearch.searchDaysAhead = v;
@@ -52,10 +54,9 @@ export async function POST(request: Request) {
       if (Number.isFinite(v) && v > 0) overrideSearch.adults = v;
     }
     if (body.selectAirlines != null) {
-      const list =
-        Array.isArray(body.selectAirlines)
-          ? body.selectAirlines
-          : parseListCsv(body.selectAirlines);
+      const list = Array.isArray(body.selectAirlines)
+        ? body.selectAirlines
+        : parseListCsv(body.selectAirlines);
       if (list) overrideSearch.selectAirlines = list;
     }
     if (body.maxPriceJPY != null) {
@@ -79,7 +80,8 @@ export async function POST(request: Request) {
       },
     };
 
-    const result = await runFullSearch(mergedCfg);
+    const mode = body.mode === "light" ? "light" : "full";
+    const result = await runFullSearch(mergedCfg, mode);
     return NextResponse.json(result);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

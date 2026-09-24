@@ -28,6 +28,8 @@ export interface CronConfig {
 export interface AppConfig {
   kiwiApiKey: string;
   serpApiKey: string;
+  amadeusClientId: string;
+  amadeusClientSecret: string;
   search: SearchConfig;
   email: EmailConfig;
   cron: CronConfig;
@@ -53,6 +55,8 @@ export function loadConfig(): AppConfig {
   return {
     kiwiApiKey: env.KIWI_API_KEY ?? "",
     serpApiKey: env.SERPAPI_KEY ?? "",
+    amadeusClientId: env.AMADEUS_CLIENT_ID ?? "",
+    amadeusClientSecret: env.AMADEUS_CLIENT_SECRET ?? "",
     search: {
       flyFrom: env.FLY_FROM ?? "TYO",
       flyTo: env.FLY_TO ?? "DLC",

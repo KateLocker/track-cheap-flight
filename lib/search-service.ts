@@ -1,4 +1,4 @@
-import { loadConfig, AppConfig } from "./config";
+import { loadConfig, AppConfig, SearchConfig } from "./config";
 import {
   searchRoundTripFlexible as kiwiSearch,
   KiwiFlight,
@@ -13,6 +13,10 @@ import {
   getFirstLegDeparture as serpFirstDep,
   getReturnLegDeparture as serpReturnDep,
 } from "./google-flights-api";
+import {
+  searchRoundTripFlexible as amadeusSearch,
+  AmadeusRoundTrip,
+} from "./amadeus-api";
 import {
   insertSearchRun,
   insertFlightRecord,
@@ -55,12 +59,14 @@ export interface UnifiedFlight {
   deep_link: string;
   booking_token: string;
   raw: unknown;
+  source: "kiwi" | "serpapi" | "amadeus";
 }
 
 function unifyKiwi(f: KiwiFlight): UnifiedFlight {
-  const airlineCode = kiwiAirlines(f).split(",")[0] || f.airlines[0] || "?";
+  const airlineCode =
+    kiwiAirlines(f).split(",")[0] || f.airlines[0] || "?";
   return {
-    id: f.id,
+    id: `kiwi-${f.id}`,
     priceJPY: f.price,
     currency: f.currency || "JPY",
     flyFrom: f.flyFrom,
@@ -74,13 +80,15 @@ function unifyKiwi(f: KiwiFlight): UnifiedFlight {
     deep_link: f.deep_link || "",
     booking_token: f.booking_token || "",
     raw: { id: f.id, route: f.route.slice(0, 8) },
+    source: "kiwi",
   };
 }
 
 function unifySerp(f: RoundTripSearchResult): UnifiedFlight {
-  const airlineCode = serpAirlines(f).split(",")[0] || f.airlines[0] || "?";
+  const airlineCode =
+    serpAirlines(f).split(",")[0] || f.airlines[0] || "?";
   return {
-    id: f.id,
+    id: `serp-${f.id}`,
     priceJPY: f.price,
     currency: f.currency || "JPY",
     flyFrom: f.flyFrom,
@@ -94,8 +102,32 @@ function unifySerp(f: RoundTripSearchResult): UnifiedFlight {
     deep_link: f.deep_link || "",
     booking_token: f.booking_token || "",
     raw: f.route,
+    source: "serpapi",
   };
 }
+
+function unifyAmadeus(f: AmadeusRoundTrip): UnifiedFlight {
+  const airlineCode = f.airlines[0] || "?";
+  return {
+    id: `amd-${f.id}`,
+    priceJPY: f.price,
+    currency: f.currency || "JPY",
+    flyFrom: f.flyFrom,
+    flyTo: f.flyTo,
+    cityFrom: f.cityFrom,
+    cityTo: f.cityTo,
+    airlineCode,
+    departureAt: f.local_departure,
+    returnAt: f.return_departure,
+    nightsInDest: f.nightsInDest || 0,
+    deep_link: f.deep_link || "",
+    booking_token: f.booking_token || "",
+    raw: f.route.slice(0, 10),
+    source: "amadeus",
+  };
+}
+
+export type SearchMode = "full" | "light";
 
 export interface SearchResult {
   success: boolean;
@@ -107,57 +139,143 @@ export interface SearchResult {
   previousLowest: number | null;
   emailSent: boolean;
   emailError?: string;
-  provider?: "kiwi" | "serpapi" | "none";
+  provider?: "kiwi" | "serpapi" | "amadeus" | "mixed" | "none";
+  mode?: SearchMode;
 }
 
-export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
+async function collectKiwi(
+  cfg: AppConfig,
+  flights: UnifiedFlight[],
+  errors: string[]
+) {
+  if (!cfg.kiwiApiKey) return;
+  try {
+    const r = await kiwiSearch(cfg.kiwiApiKey, cfg.search);
+    for (const f of r) flights.push(unifyKiwi(f));
+  } catch (e) {
+    errors.push(`Kiwi: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+async function collectSerp(
+  cfg: AppConfig,
+  flights: UnifiedFlight[],
+  errors: string[]
+) {
+  if (!cfg.serpApiKey) return;
+  try {
+    const r = await serpSearch(cfg.serpApiKey, cfg.search);
+    for (const f of r) flights.push(unifySerp(f));
+  } catch (e) {
+    errors.push(`SerpAPI: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+async function collectAmadeus(
+  cfg: AppConfig,
+  flights: UnifiedFlight[],
+  errors: string[],
+  mode: SearchMode
+) {
+  if (!cfg.amadeusClientId || !cfg.amadeusClientSecret) return;
+  try {
+    const r = await amadeusSearch(
+      cfg.amadeusClientId,
+      cfg.amadeusClientSecret,
+      cfg.search,
+      { lightweight: mode === "light" }
+    );
+    for (const f of r) flights.push(unifyAmadeus(f));
+  } catch (e) {
+    errors.push(
+      `Amadeus: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+}
+
+export async function runFullSearch(
+  cfg?: AppConfig,
+  mode: SearchMode = "full"
+): Promise<SearchResult> {
   const config = cfg ?? loadConfig();
   const startedAt = new Date().toISOString();
 
-  let flights: UnifiedFlight[] = [];
-  let errorMsg: string | null = null;
-  let provider: "kiwi" | "serpapi" | "none" = "none";
+  const flights: UnifiedFlight[] = [];
+  const errors: string[] = [];
+  const providerSet = new Set<"kiwi" | "serpapi" | "amadeus">();
 
-  const useSerpapi = !!config.serpApiKey && config.serpApiKey.length > 5;
-  const useKiwi = !useSerpapi && !!config.kiwiApiKey && !config.kiwiApiKey.includes("your_kiwi");
+  const useSerp = !!config.serpApiKey && config.serpApiKey.length > 5;
+  const useAmadeus =
+    !!config.amadeusClientId && !!config.amadeusClientSecret;
+  const useKiwi =
+    !!config.kiwiApiKey && !config.kiwiApiKey.includes("your_kiwi");
 
-  if (useSerpapi) {
-    provider = "serpapi";
-    try {
-      const results = await serpSearch(config.serpApiKey, config.search);
-      flights = results.map(unifySerp).sort((a, b) => a.priceJPY - b.priceJPY);
-    } catch (err: unknown) {
-      errorMsg = err instanceof Error ? err.message : String(err);
+  try {
+    if (useSerp) {
+      await collectSerp(config, flights, errors);
+      if (flights.length > 0) providerSet.add("serpapi");
     }
-  } else if (useKiwi) {
-    provider = "kiwi";
-    try {
-      const results = await kiwiSearch(config.kiwiApiKey, config.search);
-      flights = results.map(unifyKiwi).sort((a, b) => a.priceJPY - b.priceJPY);
-    } catch (err: unknown) {
-      errorMsg = err instanceof Error ? err.message : String(err);
-    }
-  } else {
-    errorMsg =
-      "SERPAPI_KEY / KIWI_API_KEY が未設定です。Vercel の Environment Variables に、SerpAPI または Kiwi Tequila の API Key を設定してください。";
+  } catch {
+    /* ignore outer */
   }
 
-  const savedRecordIds: number[] = [];
+  try {
+    if (
+      useAmadeus &&
+      (mode === "light" || flights.length < 5)
+    ) {
+      await collectAmadeus(config, flights, errors, mode);
+      if (flights.some((f) => f.source === "amadeus"))
+        providerSet.add("amadeus");
+    }
+  } catch {
+    /* ignore outer */
+  }
+
+  try {
+    if (useKiwi && flights.length < 5) {
+      await collectKiwi(config, flights, errors);
+      if (flights.some((f) => f.source === "kiwi"))
+        providerSet.add("kiwi");
+    }
+  } catch {
+    /* ignore outer */
+  }
+
+  flights.sort((a, b) => a.priceJPY - b.priceJPY);
+
   let minPrice: number | null = null;
+  const savedRecordIds: number[] = [];
+  let combinedErr: string | null = null;
+
+  if (
+    flights.length === 0 &&
+    !useSerp &&
+    !useKiwi &&
+    !useAmadeus
+  ) {
+    combinedErr =
+      "SERPAPI_KEY / KIWI_API_KEY / AMADEUS_CLIENT_ID + AMADEUS_CLIENT_SECRET のいずれかを Vercel Environment Variables に設定してください。";
+  } else if (flights.length === 0) {
+    if (errors.length > 0) combinedErr = errors.join(" | ").slice(0, 900);
+  }
 
   const searchRunId = insertSearchRun({
     started_at: startedAt,
     finished_at: new Date().toISOString(),
     flights_found: flights.length,
     min_price: flights[0]?.priceJPY ?? null,
-    status: errorMsg ? (flights.length > 0 ? "partial" : "failed") : "success",
-    error_message: errorMsg,
+    status: combinedErr
+      ? flights.length > 0
+        ? "partial"
+        : "failed"
+      : "success",
+    error_message: combinedErr,
   });
 
   for (const f of flights) {
     const price = f.priceJPY;
     if (minPrice == null || price < minPrice) minPrice = price;
-
     try {
       const id = insertFlightRecord({
         search_run_id: searchRunId,
@@ -172,11 +290,14 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
         nights_in_dest: f.nightsInDest || 0,
         booking_token: f.booking_token || "",
         deep_link: f.deep_link || "",
-        raw_data: typeof f.raw === "string" ? f.raw : JSON.stringify(f.raw).slice(0, 8000),
+        raw_data:
+          typeof f.raw === "string"
+            ? f.raw
+            : JSON.stringify({ source: f.source, data: f.raw }).slice(0, 8000),
       });
       savedRecordIds.push(id);
-    } catch (e) {
-      // skip on individual insert failure
+    } catch {
+      // skip
     }
   }
 
@@ -206,7 +327,10 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
       created_at: new Date().toISOString(),
     };
 
-    const existing = getLatestLowestPrice(config.search.flyFrom, config.search.flyTo);
+    const existing = getLatestLowestPrice(
+      config.search.flyFrom,
+      config.search.flyTo
+    );
     previousLowest = existing?.min_price ?? null;
     isNewLowest = !existing || cheapest.priceJPY < existing.min_price;
 
@@ -223,14 +347,24 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
       flight_record_id: savedRecordIds[0],
     });
 
-    const needAlertByThreshold = cheapest.priceJPY <= config.email.alertPriceJPY;
+    const needAlertByThreshold =
+      cheapest.priceJPY <= config.email.alertPriceJPY;
     const needAlertByNewLow = isNewLowest && config.email.enabled;
 
-    if (lowestFlight && (needAlertByThreshold || needAlertByNewLow) && config.email.enabled) {
+    if (
+      lowestFlight &&
+      (needAlertByThreshold || needAlertByNewLow) &&
+      config.email.enabled
+    ) {
       const recentCount = getRecentNotifications(lowestFlight.id!, 12);
       if (recentCount === 0) {
         try {
-          await sendAlertEmail(config.email, lowestFlight, isNewLowest, previousLowest);
+          await sendAlertEmail(
+            config.email,
+            lowestFlight,
+            isNewLowest,
+            previousLowest
+          );
           emailSent = true;
           insertNotificationLog({
             flight_record_id: lowestFlight.id!,
@@ -253,9 +387,14 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
     }
   }
 
+  let provider: SearchResult["provider"] = "none";
+  if (providerSet.size > 1) provider = "mixed";
+  else if (providerSet.size === 1)
+    provider = Array.from(providerSet)[0] as SearchResult["provider"];
+
   return {
-    success: !errorMsg || flights.length > 0,
-    error: errorMsg ?? undefined,
+    success: !combinedErr || flights.length > 0,
+    error: combinedErr ?? undefined,
     flightsFound: flights.length,
     minPrice,
     lowestFlight,
@@ -264,5 +403,8 @@ export async function runFullSearch(cfg?: AppConfig): Promise<SearchResult> {
     emailSent,
     emailError,
     provider,
+    mode,
   };
 }
+
+export type { SearchConfig };
