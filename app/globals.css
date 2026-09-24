@@ -1,17 +1,6 @@
-@import "tailwindcss";
-
-@theme {
-  --color-primary-50: #fef7ee;
-  --color-primary-100: #fdedd3;
-  --color-primary-200: #fad7a5;
-  --color-primary-300: #f6bb6d;
-  --color-primary-400: #f19532;
-  --color-primary-500: #ee7a11;
-  --color-primary-600: #df5f07;
-  --color-primary-700: #b94609;
-  --color-primary-800: #93370f;
-  --color-primary-900: #772f10;
-}
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 :root {
   --bg: #fffaf3;
