@@ -1,5 +1,5 @@
 import axios from "axios";
-import { format, addDays, addMonths } from "date-fns";
+import { format, addDays } from "date-fns";
 import type { SearchConfig } from "./config";
 
 export interface GFlightsSegment {
@@ -28,8 +28,6 @@ export interface SerpSearchParams {
   arrival_id: string;
   outbound_date_start: Date;
   outbound_date_end: Date;
-  minNights: number;
-  maxNights: number;
   airlineCodes?: string[];
   maxPrice?: number;
   adults?: number;
@@ -54,12 +52,13 @@ export async function searchGoogleFlightsOneWay(
     api_key: params.api_key,
     departure_id: params.departure_id,
     arrival_id: params.arrival_id,
-    outbound_date: dateRangeToStr(params.outbound_date_start, params.outbound_date_end),
+    outbound_date: dateRangeToStr(
+      params.outbound_date_start,
+      params.outbound_date_end
+    ),
     currency: params.currency ?? "JPY",
     hl: params.hl ?? "ja",
     adults: params.adults ?? 1,
-    stops: 1,
-    travel_class: 1,
   };
 
   if (params.airlineCodes && params.airlineCodes.length > 0) {
@@ -75,14 +74,41 @@ export async function searchGoogleFlightsOneWay(
       timeout: 90_000,
     });
     const data = resp.data as {
-      best_flights?: Array<{ flights: GFlightsSegment[][]; price: number; type?: string; deep_link?: string; total_duration?: number; layovers?: number }>;
-      other_flights?: Array<{ flights: GFlightsSegment[][]; price: number; deep_link?: string; total_duration?: number; layovers?: number }>;
+      best_flights?: Array<{
+        flights: GFlightsSegment[][];
+        price: number;
+        type?: string;
+        deep_link?: string;
+        total_duration?: number;
+        layovers?: number;
+      }>;
+      other_flights?: Array<{
+        flights: GFlightsSegment[][];
+        price: number;
+        deep_link?: string;
+        total_duration?: number;
+        layovers?: number;
+      }>;
+      price_insights?: { lowest_price?: number; typical_price?: number; price_level?: string };
+      search_metadata?: unknown;
+      search_parameters?: unknown;
     };
 
     const out: GFlightsOption[] = [];
-    const push = (list: typeof data.best_flights) => {
+    const push = (
+      list:
+        | Array<{
+            flights: GFlightsSegment[][];
+            price: number;
+            deep_link?: string;
+            total_duration?: number;
+            layovers?: number;
+          }>
+        | undefined
+    ) => {
       if (!list) return;
       for (const item of list) {
+        if (!item || !item.flights || !item.price) continue;
         out.push({
           price: item.price,
           flights: item.flights,
@@ -99,9 +125,7 @@ export async function searchGoogleFlightsOneWay(
     if (axios.isAxiosError(err) && err.response) {
       const status = err.response.status;
       const body = JSON.stringify(err.response.data);
-      throw new Error(
-        `SerpAPI HTTP ${status}: ${body.slice(0, 600)}`
-      );
+      throw new Error(`SerpAPI HTTP ${status}: ${body.slice(0, 600)}`);
     }
     throw err;
   }
@@ -157,7 +181,7 @@ export async function searchRoundTripFlexible(
   const windows: Array<{ start: Date; end: Date }> = [];
   const totalDays = config.searchDaysAhead;
   let cur = new Date(today);
-  const stepDays = Math.min(21, Math.max(7, Math.ceil(totalDays / 6)));
+  const stepDays = Math.min(14, Math.max(7, Math.ceil(totalDays / 8)));
   while (cur < maxDeparture) {
     const end = addDays(cur, stepDays);
     windows.push({
@@ -170,10 +194,10 @@ export async function searchRoundTripFlexible(
   const pool: RoundTripSearchResult[] = [];
   const seenKeys = new Set<string>();
 
-  for (const w of windows) {
+  for (let wIdx = 0; wIdx < Math.min(windows.length, 5); wIdx++) {
+    const w = windows[wIdx];
     try {
-      const windowEnd = addDays(w.end, config.maxNights);
-      const outbounds = await searchGoogleFlightsOneWay({
+      let outbounds = await searchGoogleFlightsOneWay({
         api_key: apiKey,
         departure_id: config.flyFrom,
         arrival_id: config.flyTo,
@@ -184,135 +208,182 @@ export async function searchRoundTripFlexible(
         adults: config.adults,
         currency: "JPY",
         hl: "ja",
-        minNights: config.minNights,
-        maxNights: config.maxNights,
       });
+
+      if (
+        outbounds.length === 0 &&
+        config.selectAirlines.length > 0
+      ) {
+        outbounds = await searchGoogleFlightsOneWay({
+          api_key: apiKey,
+          departure_id: config.flyFrom,
+          arrival_id: config.flyTo,
+          outbound_date_start: w.start,
+          outbound_date_end: w.end,
+          maxPrice: config.maxPriceJPY ?? undefined,
+          adults: config.adults,
+          currency: "JPY",
+          hl: "ja",
+        });
+      }
 
       if (outbounds.length === 0) continue;
 
-      for (let i = 0; i < Math.min(outbounds.length, 12); i++) {
-        const out = outbounds[i];
+      const outCandidates = outbounds.slice(0, 8);
+      for (let i = 0; i < outCandidates.length; i++) {
+        const out = outCandidates[i];
         const outFirstLeg = out.flights[0]?.[0];
-        const outLastLegLastSeg = out.flights[out.flights.length - 1].slice(-1)[0];
+        const outLastLegLastSeg =
+          out.flights[out.flights.length - 1].slice(-1)[0];
         const outboundDepartStr = outFirstLeg?.departure_airport?.time;
         const outboundArriveStr = outLastLegLastSeg?.arrival_airport?.time;
-        if (!outboundDepartStr || !outboundArriveStr) continue;
+        if (!outboundDepartStr) continue;
 
         const outDepartDate = new Date(outboundDepartStr);
-        const outArriveDate = new Date(outboundArriveStr);
         if (!Number.isFinite(outDepartDate.getTime())) continue;
 
         const returnStart = addDays(outDepartDate, config.minNights);
         const returnEnd = addDays(outDepartDate, config.maxNights);
+        const windowEnd = addDays(w.end, config.maxNights);
         if (returnStart > windowEnd) continue;
-        const returnWindowEnd = returnEnd < windowEnd ? returnEnd : windowEnd;
+        const returnWindowEnd =
+          returnEnd < windowEnd ? returnEnd : windowEnd;
 
-        try {
-          const returns = await searchGoogleFlightsOneWay({
+        let returns = await searchGoogleFlightsOneWay({
+          api_key: apiKey,
+          departure_id: config.flyTo,
+          arrival_id: config.flyFrom,
+          outbound_date_start: returnStart,
+          outbound_date_end: returnWindowEnd,
+          airlineCodes: config.selectAirlines,
+          maxPrice: config.maxPriceJPY
+            ? config.maxPriceJPY - out.price
+            : undefined,
+          adults: config.adults,
+          currency: "JPY",
+          hl: "ja",
+        });
+
+        if (
+          returns.length === 0 &&
+          config.selectAirlines.length > 0
+        ) {
+          returns = await searchGoogleFlightsOneWay({
             api_key: apiKey,
             departure_id: config.flyTo,
             arrival_id: config.flyFrom,
             outbound_date_start: returnStart,
             outbound_date_end: returnWindowEnd,
-            airlineCodes: config.selectAirlines,
             maxPrice: config.maxPriceJPY
               ? config.maxPriceJPY - out.price
               : undefined,
             adults: config.adults,
             currency: "JPY",
             hl: "ja",
-            minNights: 0,
-            maxNights: 0,
           });
+        }
 
-          for (let j = 0; j < Math.min(returns.length, 10); j++) {
-            const ret = returns[j];
-            const retFirstLeg = ret.flights[0]?.[0];
-            const retLastLegLastSeg =
-              ret.flights[ret.flights.length - 1].slice(-1)[0];
-            const retDepartStr = retFirstLeg?.departure_airport?.time;
-            const retArriveStr = retLastLegLastSeg?.arrival_airport?.time;
-            if (!retDepartStr) continue;
-            const retDepartDate = new Date(retDepartStr);
-            if (!Number.isFinite(retDepartDate.getTime())) continue;
+        for (let j = 0; j < Math.min(returns.length, 10); j++) {
+          const ret = returns[j];
+          const retFirstLeg = ret.flights[0]?.[0];
+          const retLastLegLastSeg =
+            ret.flights[ret.flights.length - 1].slice(-1)[0];
+          const retDepartStr = retFirstLeg?.departure_airport?.time;
+          const retArriveStr = retLastLegLastSeg?.arrival_airport?.time;
+          if (!retDepartStr) continue;
+          const retDepartDate = new Date(retDepartStr);
+          if (!Number.isFinite(retDepartDate.getTime())) continue;
 
-            const nightsMs =
-              retDepartDate.getTime() - outDepartDate.getTime();
-            const nights = Math.max(
-              0,
-              Math.round(nightsMs / (1000 * 60 * 60 * 24))
+          const nightsMs =
+            retDepartDate.getTime() - outDepartDate.getTime();
+          const nights = Math.max(
+            0,
+            Math.round(nightsMs / (1000 * 60 * 60 * 24))
+          );
+          if (nights < config.minNights || nights > config.maxNights)
+            continue;
+
+          const totalPrice = out.price + ret.price;
+          if (
+            config.maxPriceJPY != null &&
+            totalPrice > config.maxPriceJPY
+          )
+            continue;
+
+          const outAirline = firstAirlineCode(out.flights);
+          const retAirline = firstAirlineCode(ret.flights);
+          if (config.selectAirlines.length > 0) {
+            const outOK = config.selectAirlines.some(
+              (code) => outAirline === code
             );
-            if (nights < config.minNights || nights > config.maxNights) continue;
-
-            const totalPrice = out.price + ret.price;
-            if (
-              config.maxPriceJPY != null &&
-              totalPrice > config.maxPriceJPY
-            )
-              continue;
-
-            const outAirline = firstAirlineCode(out.flights);
-            const retAirline = firstAirlineCode(ret.flights);
-            if (
-              config.selectAirlines.length > 0 &&
-              !(
-                config.selectAirlines.includes(outAirline) &&
-                config.selectAirlines.includes(retAirline)
-              )
-            )
-              continue;
-
-            const key = `${format(
-              outDepartDate,
-              "yyyyMMdd"
-            )}|${format(retDepartDate, "yyyyMMdd")}|${outAirline}|${Math.floor(
-              totalPrice / 1000
-            )}`;
-            if (seenKeys.has(key)) continue;
-            seenKeys.add(key);
-
-            const airlinesSet = new Set<string>();
-            const route: GFlightsSegment[] = [];
-            for (const leg of out.flights) {
-              for (const s of leg) {
-                if (s.airline_code) airlinesSet.add(s.airline_code);
-                route.push(s);
-              }
+            const retOK = config.selectAirlines.some(
+              (code) => retAirline === code
+            );
+            const outSegs = segmentCollectAirline(out.flights);
+            const retSegs = segmentCollectAirline(ret.flights);
+            const outSegsOK = outSegs.some((s) =>
+              config.selectAirlines.includes(s)
+            );
+            const retSegsOK = retSegs.some((s) =>
+              config.selectAirlines.includes(s)
+            );
+            const bothOK =
+              (outOK || outSegsOK) && (retOK || retSegsOK);
+            if (!bothOK) {
+              // if not matching but low price, still keep up to 30% of such options
+              const priceOK =
+                !config.maxPriceJPY ||
+                totalPrice <= config.maxPriceJPY * 1.15;
+              if (!priceOK) continue;
             }
-            for (const leg of ret.flights) {
-              for (const s of leg) {
-                if (s.airline_code) airlinesSet.add(s.airline_code);
-                route.push(s);
-              }
-            }
-
-            pool.push({
-              id: key,
-              price: totalPrice,
-              currency: "JPY",
-              flyFrom: config.flyFrom,
-              flyTo: config.flyTo,
-              cityFrom: config.flyFrom,
-              cityTo: config.flyTo,
-              local_departure: isoDate(outboundDepartStr),
-              local_arrival: isoDate(outboundArriveStr),
-              return_departure: isoDate(retDepartStr),
-              return_arrival: isoDate(retArriveStr ?? retDepartStr),
-              airlines: Array.from(airlinesSet),
-              nightsInDest: nights,
-              deep_link:
-                out.deep_link && ret.deep_link
-                  ? out.deep_link
-                  : "",
-              booking_token:
-                (out.departure_token || "") +
-                "|" +
-                (ret.departure_token || ""),
-              route,
-            });
           }
-        } catch {
-          /* ignore single return search error */
+
+          const key = `${format(
+            outDepartDate,
+            "yyyyMMdd"
+          )}|${format(retDepartDate, "yyyyMMdd")}|${outAirline}|${
+            retAirline
+          }|${Math.floor(totalPrice / 1000)}`;
+          if (seenKeys.has(key)) continue;
+          seenKeys.add(key);
+
+          const airlinesSet = new Set<string>();
+          const route: GFlightsSegment[] = [];
+          for (const leg of out.flights) {
+            for (const s of leg) {
+              if (s.airline_code) airlinesSet.add(s.airline_code);
+              route.push(s);
+            }
+          }
+          for (const leg of ret.flights) {
+            for (const s of leg) {
+              if (s.airline_code) airlinesSet.add(s.airline_code);
+              route.push(s);
+            }
+          }
+
+          pool.push({
+            id: key,
+            price: totalPrice,
+            currency: "JPY",
+            flyFrom: config.flyFrom,
+            flyTo: config.flyTo,
+            cityFrom: config.flyFrom,
+            cityTo: config.flyTo,
+            local_departure: isoDate(outboundDepartStr),
+            local_arrival: isoDate(
+              outboundArriveStr ?? outboundDepartStr
+            ),
+            return_departure: isoDate(retDepartStr),
+            return_arrival: isoDate(retArriveStr ?? retDepartStr),
+            airlines: Array.from(airlinesSet),
+            nightsInDest: nights,
+            deep_link: out.deep_link ?? ret.deep_link ?? "",
+            booking_token: `${out.departure_token ?? ""}|${
+              ret.departure_token ?? ""
+            }`,
+            route,
+          });
         }
       }
     } catch {
@@ -324,7 +395,9 @@ export async function searchRoundTripFlexible(
   return pool;
 }
 
-export function getAirlineCodesFromFlight(f: RoundTripSearchResult): string {
+export function getAirlineCodesFromFlight(
+  f: RoundTripSearchResult
+): string {
   return f.airlines.join(",");
 }
 
@@ -336,8 +409,6 @@ export function getReturnLegDeparture(f: RoundTripSearchResult): string {
   return f.return_departure;
 }
 
-const MONTHLY = { searchBudget: 250 };
-
 export function getSearchBudgetHint() {
-  return MONTHLY;
+  return { searchBudget: 250 };
 }

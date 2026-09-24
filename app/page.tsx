@@ -73,7 +73,41 @@ type SearchResult = {
   isNewLowest: boolean;
   previousLowest: number | null;
   emailSent: boolean;
+  provider?: "kiwi" | "serpapi" | "none";
 };
+
+type SearchParams = {
+  flyFrom: string;
+  flyTo: string;
+  searchDaysAhead: number;
+  minNights: number;
+  maxNights: number;
+  selectAirlines: string;
+  alertPriceJPY: number;
+};
+
+const DEFAULT_SEARCH: SearchParams = {
+  flyFrom: "TYO",
+  flyTo: "DLC",
+  searchDaysAhead: 90,
+  minNights: 3,
+  maxNights: 14,
+  selectAirlines: "NH",
+  alertPriceJPY: 70000,
+};
+
+const AIRLINE_OPTIONS = [
+  { code: "NH", name: "全日空 ANA" },
+  { code: "JL", name: "日本航空 JAL" },
+  { code: "CA", name: "中国国航 Air China" },
+  { code: "CZ", name: "南方航空 China Southern" },
+  { code: "MU", name: "東方航空 China Eastern" },
+  { code: "HU", name: "海南航空 Hainan" },
+  { code: "9C", name: "春秋航空 Spring" },
+  { code: "ZH", name: "深圳航空 Shenzhen" },
+  { code: "MF", name: "厦门航空 Xiamen" },
+  { code: "", name: "指定なし（全航空会社）" },
+];
 
 function fmtJPY(n: number | null | undefined): string {
   if (n == null) return "-";
@@ -89,7 +123,9 @@ function fmtDateTime(iso?: string | null): string {
   try {
     const d = new Date(iso);
     const pad = (n: number) => n.toString().padStart(2, "0");
-    return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(
+      d.getHours()
+    )}:${pad(d.getMinutes())}`;
   } catch {
     return iso;
   }
@@ -118,6 +154,12 @@ function timeAgo(iso?: string | null): string {
   return `${d}日前`;
 }
 
+function toIntOr(v: string, fallback: number): number {
+  const n = parseInt(v, 10);
+  if (Number.isFinite(n) && n >= 0) return n;
+  return fallback;
+}
+
 export default function HomePage() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -125,6 +167,7 @@ export default function HomePage() {
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
   const [sendingTest, setSendingTest] = useState(false);
   const [testMsg, setTestMsg] = useState<string | null>(null);
+  const [params, setParams] = useState<SearchParams>(DEFAULT_SEARCH);
 
   const load = async () => {
     setLoading(true);
@@ -132,6 +175,20 @@ export default function HomePage() {
       const r = await fetch("/api/dashboard", { cache: "no-store" });
       const json = (await r.json()) as DashboardData;
       setData(json);
+      if (json?.config) {
+        setParams({
+          flyFrom: json.config.flyFrom || DEFAULT_SEARCH.flyFrom,
+          flyTo: json.config.flyTo || DEFAULT_SEARCH.flyTo,
+          searchDaysAhead:
+            json.config.searchDaysAhead || DEFAULT_SEARCH.searchDaysAhead,
+          minNights: json.config.minNights ?? DEFAULT_SEARCH.minNights,
+          maxNights: json.config.maxNights ?? DEFAULT_SEARCH.maxNights,
+          selectAirlines: (json.config.selectAirlines || []).join(",") ||
+            DEFAULT_SEARCH.selectAirlines,
+          alertPriceJPY:
+            json.config.alertPrice || DEFAULT_SEARCH.alertPriceJPY,
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -145,7 +202,25 @@ export default function HomePage() {
     setSearching(true);
     setSearchResult(null);
     try {
-      const r = await fetch("/api/search", { method: "POST" });
+      const r = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          flyFrom: params.flyFrom.trim().toUpperCase(),
+          flyTo: params.flyTo.trim().toUpperCase(),
+          searchDaysAhead: toIntOr(
+            String(params.searchDaysAhead),
+            DEFAULT_SEARCH.searchDaysAhead
+          ),
+          minNights: toIntOr(String(params.minNights), DEFAULT_SEARCH.minNights),
+          maxNights: toIntOr(String(params.maxNights), DEFAULT_SEARCH.maxNights),
+          selectAirlines: params.selectAirlines,
+          alertPriceJPY: toIntOr(
+            String(params.alertPriceJPY),
+            DEFAULT_SEARCH.alertPriceJPY
+          ),
+        }),
+      });
       const json = (await r.json()) as SearchResult;
       setSearchResult(json);
       await load();
@@ -159,7 +234,11 @@ export default function HomePage() {
     setTestMsg(null);
     try {
       const r = await fetch("/api/test-email", { method: "POST" });
-      const json = (await r.json()) as { success: boolean; error?: string; sentTo?: string };
+      const json = (await r.json()) as {
+        success: boolean;
+        error?: string;
+        sentTo?: string;
+      };
       if (json.success) {
         setTestMsg(`✅ テストメール送信完了 → ${json.sentTo}`);
       } else {
@@ -176,11 +255,16 @@ export default function HomePage() {
     if (!data) return [] as FlightRecord[];
     const seen = new Map<string, FlightRecord>();
     for (const f of data.recentFlights) {
-      const k = `${f.departure_at.slice(0, 10)}|${f.return_at.slice(0, 10)}|${f.airline}`;
+      const k = `${f.departure_at.slice(0, 10)}|${f.return_at.slice(
+        0,
+        10
+      )}|${f.airline}`;
       const cur = seen.get(k);
       if (!cur || f.price < cur.price) seen.set(k, f);
     }
-    return Array.from(seen.values()).sort((a, b) => a.price - b.price).slice(0, 15);
+    return Array.from(seen.values())
+      .sort((a, b) => a.price - b.price)
+      .slice(0, 15);
   }, [data]);
 
   const historyMax = useMemo(() => {
@@ -188,15 +272,24 @@ export default function HomePage() {
     return Math.max(...data.priceHistory.map((p) => p.min_price));
   }, [data]);
 
+  const update = (key: keyof SearchParams) => (
+    e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
+  ) => {
+    setParams((prev) => ({ ...prev, [key]: e.target.value }));
+  };
+
   return (
     <main className="max-w-6xl mx-auto px-4 py-8 md:py-12">
       <header className="mb-10 text-center">
-        <div className="inline-block mb-4 text-5xl md:text-6xl">✈️ んぽ</div>
+        <div className="inline-block mb-4 text-5xl md:text-6xl">
+          ✈️ んぽ
+        </div>
         <h1 className="text-3xl md:text-4xl font-black tracking-tight text-primary-800">
-          ANA 東京 ⇔ 大连 最安値トラッカー
+          東京 ⇔ 大連 最安値トラッカー
         </h1>
         <p className="mt-3 text-primary-700/80">
-          自動で毎日数回検索 → 過去最安値 or 設定価格以下になったらメールでお知らせ 💌
+          自動で毎日検索 → 過去最安値 or 設定価格以下になったらメールでお知らせ
+          💌
         </p>
       </header>
 
@@ -204,7 +297,9 @@ export default function HomePage() {
         <div className="grid md:grid-cols-2 gap-6 items-start">
           <div>
             <div className="flex items-center gap-2 mb-2">
-              <span className="npo-tag bg-amber-100 text-amber-800">🏆 現在の歴代最安値</span>
+              <span className="npo-tag bg-amber-100 text-amber-800">
+                🏆 現在の歴代最安値
+              </span>
               {data?.latestLowest && (
                 <span className="npo-tag bg-emerald-100 text-emerald-800">
                   更新: {timeAgo(data.latestLowest.last_checked_at)}
@@ -236,7 +331,7 @@ export default function HomePage() {
                     rel="noreferrer"
                     className="npo-btn inline-block mt-5 text-base"
                   >
-                    👉 ANAで予約する
+                    👉 ANA / Googleで予約する
                   </a>
                 )}
               </div>
@@ -250,28 +345,104 @@ export default function HomePage() {
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
-                <div className="text-xs text-amber-700 mb-1">🗓 検索範囲</div>
-                <div className="font-bold text-amber-900">
-                  今日から {data?.config.searchDaysAhead ?? 90} 日間
+                <label className="block text-xs text-amber-700 mb-1">
+                  🛫 出発（空港コード
+                </label>
+                <input
+                  type="text"
+                  value={params.flyFrom}
+                  onChange={update("flyFrom")}
+                  className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold uppercase"
+                  placeholder="TYO / NRT HND"
+                />
+              </div>
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
+                <label className="block text-xs text-amber-700 mb-1">
+                  🛬 到着（空港コード）
+                </label>
+                <input
+                  type="text"
+                  value={params.flyTo}
+                  onChange={update("flyTo")}
+                  className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold uppercase"
+                  placeholder="DLC / DLC → 大連周子水子"
+                />
+              </div>
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
+                <label className="block text-xs text-amber-700 mb-1">
+                  🗓 検索範囲（今日から何日先まで）
+                </label>
+                <input
+                  type="number"
+                  min={7}
+                  max={365}
+                  step={1}
+                  value={params.searchDaysAhead}
+                  onChange={update("searchDaysAhead")}
+                  className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold"
+                />
+              </div>
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
+                <label className="block text-xs text-amber-700 mb-1">
+                  💼 泊数（最小〜最大）
+                </label>
+                <div className="flex gap-1 items-center">
+                  <input
+                    type="number"
+                    min={0}
+                    max={365}
+                    step={1}
+                    value={params.minNights}
+                    onChange={update("minNights")}
+                    className="w-1/2 bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold"
+                  />
+                  <span className="text-amber-700/80">〜</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={365}
+                    step={1}
+                    value={params.maxNights}
+                    onChange={update("maxNights")}
+                    className="w-1/2 bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold"
+                  />
                 </div>
               </div>
               <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
-                <div className="text-xs text-amber-700 mb-1">💼 泊数</div>
-                <div className="font-bold text-amber-900">
-                  {data?.config.minNights ?? 3} ~ {data?.config.maxNights ?? 14} 泊
-                </div>
+                <label className="block text-xs text-amber-700 mb-1">
+                  ✈️ 航空会社（複数可,「,」区切り）
+                </label>
+                <select
+                  value={params.selectAirlines}
+                  onChange={update("selectAirlines")}
+                  className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold"
+                >
+                  {AIRLINE_OPTIONS.map((o) => (
+                    <option key={o.code} value={o.code}>
+                      {o.code || "指定なし"} {o.name}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={params.selectAirlines}
+                  onChange={update("selectAirlines")}
+                  className="mt-1 w-full bg-white/80 rounded-lg px-2 py-1 border border-dashed border-amber-300 focus:outline-none focus:border-orange-400 text-xs text-amber-900"
+                  placeholder="例 NH,JL,CA"
+                />
               </div>
               <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
-                <div className="text-xs text-amber-700 mb-1">✈️ 航空会社</div>
-                <div className="font-bold text-amber-900">
-                  {data?.config.selectAirlines.join(",") || "指定なし"}
-                </div>
-              </div>
-              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
-                <div className="text-xs text-amber-700 mb-1">🔔 通知閾値</div>
-                <div className="font-bold text-amber-900">
-                  {fmtJPY(data?.config.alertPrice)} 以下
-                </div>
+                <label className="block text-xs text-amber-700 mb-1">
+                  🔔 通知閾値（円以下）
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1000}
+                  value={params.alertPriceJPY}
+                  onChange={update("alertPriceJPY")}
+                  className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold"
+                />
               </div>
             </div>
 
@@ -303,17 +474,33 @@ export default function HomePage() {
             )}
             {searchResult && (
               <div className="bg-white/70 p-4 rounded-xl border border-amber-200 text-sm space-y-1">
-                <div className="font-bold text-primary-800">📊 今回の検索結果</div>
-                <div>ステータス: {searchResult.success ? "✅ 成功" : `⚠ ${searchResult.error || "失敗"}`}</div>
+                <div className="font-bold text-primary-800 flex items-center justify-between">
+                  <span>📊 今回の検索結果</span>
+                  {searchResult.provider && (
+                    <span className="npo-tag bg-blue-100 text-blue-800">
+                      データ元: {searchResult.provider}
+                    </span>
+                  )}
+                </div>
+                <div>
+                  ステータス:{" "}
+                  {searchResult.success
+                    ? "✅ 成功"
+                    : `⚠ ${searchResult.error || "失敗"}`}
+                </div>
                 <div>発見件数: {searchResult.flightsFound} 件</div>
                 <div>最安値: {fmtJPY(searchResult.minPrice)}</div>
                 <div>
-                  歴代更新: {searchResult.isNewLowest ? "🎉 はい！" : "いいえ"}
+                  歴代更新:{" "}
+                  {searchResult.isNewLowest ? "🎉 はい！" : "いいえ"}
                   {searchResult.previousLowest != null &&
                     searchResult.isNewLowest &&
                     ` (前回: ${fmtJPY(searchResult.previousLowest)})`}
                 </div>
-                <div>メール送信: {searchResult.emailSent ? "📬 送信済み" : "スキップ"}</div>
+                <div>
+                  メール送信:{" "}
+                  {searchResult.emailSent ? "📬 送信済み" : "スキップ"}
+                </div>
               </div>
             )}
           </div>
@@ -346,12 +533,16 @@ export default function HomePage() {
             <div className="flex justify-between text-xs text-primary-700/60 mt-2">
               <span>{data.priceHistory[0]?.date.slice(5)}</span>
               <span>
-                {(
-                  data.priceHistory[Math.floor(data.priceHistory.length / 2)]
-                )?.date.slice(5)}
+                {
+                  data.priceHistory[
+                    Math.floor(data.priceHistory.length / 2)
+                  ]?.date.slice(5)
+                }
               </span>
               <span>
-                {data.priceHistory[data.priceHistory.length - 1]?.date.slice(5)}
+                {
+                  data.priceHistory[data.priceHistory.length - 1]?.date.slice(5)
+                }
               </span>
             </div>
           </div>
@@ -392,8 +583,12 @@ export default function HomePage() {
                       {i === 0 && <span className="mr-1">👑</span>}
                       {fmtJPY(f.price)}
                     </td>
-                    <td className="px-3 py-3 whitespace-nowrap">{fmtDate(f.departure_at)}</td>
-                    <td className="px-3 py-3 whitespace-nowrap">{fmtDate(f.return_at)}</td>
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      {fmtDate(f.departure_at)}
+                    </td>
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      {fmtDate(f.return_at)}
+                    </td>
                     <td className="px-3 py-3">{f.nights_in_dest}</td>
                     <td className="px-3 py-3">{f.airline}</td>
                     <td className="px-3 py-3 text-xs text-primary-700/60 whitespace-nowrap">
@@ -442,7 +637,9 @@ export default function HomePage() {
               <tbody>
                 {data.searchRuns.map((r) => (
                   <tr key={r.id} className="border-b border-amber-100">
-                    <td className="px-3 py-2 whitespace-nowrap">{fmtDateTime(r.started_at)}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      {fmtDateTime(r.started_at)}
+                    </td>
                     <td className="px-3 py-2">
                       <span
                         className={`npo-tag ${
@@ -472,13 +669,18 @@ export default function HomePage() {
           </div>
         )}
         <p className="mt-4 text-xs text-primary-700/60">
-          🕑 Cron設定: <code className="bg-amber-100 px-2 py-0.5 rounded">{data?.config.cronSchedule}</code>
-          （タイムゾーン: {data?.config.cronTimezone}） | Vercel へデプロイ時は vercel.json の schedule も参照
+          🕑 Cron設定:{" "}
+          <code className="bg-amber-100 px-2 py-0.5 rounded">
+            {data?.config.cronSchedule}
+          </code>
+          （タイムゾーン: {data?.config.cronTimezone}） | Vercel へデプロイ時は
+          vercel.json の schedule も参照
         </p>
       </section>
 
       <footer className="text-center text-xs text-primary-700/50 py-6">
-        Made with 💛 for んぽちゃむ　|　データは Kiwi.com (Tequila API) より取得
+        Made with 💛 for んぽちゃむ　|　データは SerpAPI (Google
+        Flights) + Kiwi.com (Tequila) より取得
       </footer>
     </main>
   );
