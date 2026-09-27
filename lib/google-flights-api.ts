@@ -107,50 +107,36 @@ export async function searchGoogleFlightsOneWay(
         timeout: 90_000,
       });
       const data = resp.data as {
-        best_flights?: Array<{
-          flights: GFlightsSegment[][];
-          price: number;
-          type?: string;
-          deep_link?: string;
-          total_duration?: number;
-          layovers?: number;
-          departure_token?: string;
-          booking_token?: string;
-        }>;
-        other_flights?: Array<{
-          flights: GFlightsSegment[][];
-          price: number;
-          deep_link?: string;
-          total_duration?: number;
-          layovers?: number;
-          departure_token?: string;
-          booking_token?: string;
-        }>;
-        price_insights?: { lowest_price?: number; typical_price?: number; price_level?: string };
+        best_flights?: unknown;
+        other_flights?: unknown;
+        price_insights?: unknown;
         search_metadata?: unknown;
         search_parameters?: unknown;
+        error?: unknown;
       };
+      if ((data as any).error) continue;
 
       const out: GFlightsOption[] = [];
-      const push = (
-        list:
-          | Array<{
-              flights: GFlightsSegment[][];
-              price: number;
-              deep_link?: string;
-              total_duration?: number;
-              layovers?: number;
-              departure_token?: string;
-              booking_token?: string;
-            }>
-          | undefined
-      ) => {
-        if (!list) return;
-        for (const item of list) {
-          if (!item || !item.flights || !item.price) continue;
+      type Item = {
+        flights: unknown;
+        price: number;
+        type?: string;
+        deep_link?: string;
+        total_duration?: number;
+        layovers?: number;
+        departure_token?: string;
+        booking_token?: string;
+      };
+      const push = (list: unknown) => {
+        if (!Array.isArray(list)) return;
+        for (const raw of list) {
+          const item = raw as Item | null | undefined;
+          if (!item || !item.price) continue;
+          const flightsArr = Array.isArray(item.flights) ? item.flights as GFlightsSegment[][] : null;
+          if (!flightsArr) continue;
           out.push({
             price: item.price,
-            flights: item.flights,
+            flights: flightsArr,
             deep_link: item.deep_link,
             total_duration: item.total_duration,
             layovers: item.layovers,

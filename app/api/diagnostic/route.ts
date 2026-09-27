@@ -115,21 +115,26 @@ export async function GET(req: Request) {
 
       const resp = await axios.get(SERP_API, { params, timeout: 60_000 });
       const data = resp.data as {
-        best_flights?: Array<{ price?: number; flights?: Array<Array<{ airline_code?: string }>> }>;
-        other_flights?: Array<{ price?: number; flights?: Array<Array<{ airline_code?: string }>> }>;
-        error?: string;
+        best_flights?: unknown;
+        other_flights?: unknown;
+        error?: unknown;
       };
-      const list = [...(data.best_flights || []), ...(data.other_flights || [])];
+      const bestArr = Array.isArray(data.best_flights) ? data.best_flights as Array<{ price?: number; flights?: unknown }> : [];
+      const otherArr = Array.isArray(data.other_flights) ? data.other_flights as Array<{ price?: number; flights?: unknown }> : [];
+      const list = [...bestArr, ...otherArr];
       const count = list.length;
-      const first = list[0];
+      const first = list[0] as { price?: number; flights?: unknown } | undefined;
       const firstPrice = first?.price;
       const firstAirlines = new Set<string>();
-      for (const leg of first?.flights || []) {
-        for (const seg of leg) {
-          if (seg.airline_code) firstAirlines.add(seg.airline_code);
+      const flightsArr = Array.isArray(first?.flights) ? first?.flights as Array<unknown> : [];
+      for (const leg of flightsArr) {
+        const legArr = Array.isArray(leg) ? leg as Array<{ airline_code?: string }> : [];
+        for (const seg of legArr) {
+          if (seg?.airline_code) firstAirlines.add(seg.airline_code);
         }
       }
-      if (!data.error && count > 0) {
+      const errStr = typeof data.error === "string" ? data.error : (data.error && typeof data.error === "object" ? JSON.stringify(data.error).slice(0, 300) : undefined);
+      if (!errStr && count > 0) {
         successCount++;
         if (!hitSample && firstPrice) {
           hitSample = {
@@ -141,11 +146,11 @@ export async function GET(req: Request) {
       }
       results.push({
         name: c.name,
-        ok: !data.error,
+        ok: !errStr,
         count,
         samplePrice: firstPrice,
         sampleAirlines: firstAirlines.size ? Array.from(firstAirlines) : undefined,
-        error: data.error,
+        error: errStr,
       });
       if (successCount >= 4) break;
     } catch (e) {

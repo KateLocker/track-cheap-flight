@@ -7,6 +7,7 @@ export interface SearchConfig {
   adults: number;
   selectAirlines: string[];
   maxPriceJPY: number | null;
+  mode?: "full" | "light";
 }
 
 export interface EmailConfig {

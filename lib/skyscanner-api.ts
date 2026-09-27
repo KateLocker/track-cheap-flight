@@ -2,32 +2,29 @@ import axios from "axios";
 import { addDays, format } from "date-fns";
 import type { SearchConfig } from "./config";
 
+export interface SkyscannerPlace {
+  skyId: string;
+  entityId: string;
+  name: string;
+  iata?: string;
+  type?: string;
+}
+
 export interface SkyscannerFlight {
   id?: string;
-  price?: { amount?: number; unit?: string; updateStatus?: string };
+  price?: number;
   legs?: Array<{
     id?: string;
-    origin?: { iata?: string; name?: string; entityId?: string };
-    destination?: { iata?: string; name?: string; entityId?: string };
+    origin?: { id?: string; iata?: string; name?: string; entityId?: string };
+    destination?: { id?: string; iata?: string; name?: string; entityId?: string };
     departure?: string;
     arrival?: string;
     durationInMinutes?: number;
     stopCount?: number;
-    carriers?: Array<{ id?: string; name?: string; iata?: string; imageUrl?: string }>;
+    carriers?: Array<{ id?: string; name?: string; iata?: string; imageUrl?: string; alt?: string }>;
     segments?: unknown[];
   }>;
-}
-
-export interface SkyscannerCreateSessionResp {
-  sessionToken?: string;
-  status?: string;
-  content?: {
-    results?: {
-      itineraries?: SkyscannerFlight[];
-    };
-    sortingOptions?: unknown;
-    filters?: unknown;
-  };
+  deep_link?: string;
 }
 
 export interface SkyscannerRoundTrip {
@@ -49,205 +46,395 @@ export interface SkyscannerRoundTrip {
   route: unknown[];
 }
 
-const MARKET = "JP";
-const LOCALE = "ja-JP";
+export interface PriceCalendarDay {
+  date: string;
+  price: number;
+  isMonth?: boolean;
+}
+
+const MARKET = "ja-JP";
+const COUNTRY_CODE = "JP";
 const CURRENCY = "JPY";
-const BASE = "https://skyscanner80.p.rapidapi.com/api/v1";
+const HOST = "sky-scrapper.p.rapidapi.com";
+const BASE = `https://${HOST}/api/v1`;
 
 function getHeaders(key: string): Record<string, string> {
   return {
     "x-rapidapi-key": key,
-    "x-rapidapi-host": "skyscanner80.p.rapidapi.com",
+    "x-rapidapi-host": HOST,
   };
+}
+
+export async function lookupPlace(
+  apiKey: string,
+  query: string
+): Promise<SkyscannerPlace | null> {
+  const url = `${BASE}/flights/searchAirport`;
+  const q: Record<string, unknown> = {
+    query,
+    locale: MARKET,
+  };
+  try {
+    const resp = await axios.get(url, {
+      params: q,
+      headers: getHeaders(apiKey),
+      timeout: 30_000,
+    });
+    const data = resp.data as {
+      status?: boolean;
+      data?: Array<{
+        skyId?: string;
+        entityId?: string;
+        presentation?: { title?: string; suggestionTitle?: string };
+        navigation?: { localizedName?: string; relevantFlightParams?: { skyId?: string; entityId?: string } };
+        iata?: string;
+      }>;
+    };
+    if (!data?.status || !Array.isArray(data.data) || data.data.length === 0) return null;
+    const exact = data.data.find(
+      (p: any) =>
+        (p.iata && p.iata.toUpperCase() === query.toUpperCase()) ||
+        (p.navigation?.relevantFlightParams?.skyId &&
+          p.navigation.relevantFlightParams.skyId.toUpperCase() === query.toUpperCase()) ||
+        (p.skyId && p.skyId.toUpperCase() === query.toUpperCase())
+    );
+    const pick = exact || data.data[0];
+    const skyId = pick.skyId || pick.navigation?.relevantFlightParams?.skyId;
+    const entityId = pick.entityId || pick.navigation?.relevantFlightParams?.entityId;
+    if (!skyId || !entityId) return null;
+    return {
+      skyId,
+      entityId,
+      name: pick.presentation?.suggestionTitle || pick.presentation?.title || pick.navigation?.localizedName || query,
+      iata: pick.iata,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function getPriceCalendar(
+  apiKey: string,
+  params: {
+    originSkyId: string;
+    destinationSkyId: string;
+    fromDate: string;
+    toDate: string;
+  }
+): Promise<PriceCalendarDay[]> {
+  const url = `${BASE}/flights/getPriceCalendar`;
+  const q: Record<string, unknown> = {
+    originSkyId: params.originSkyId,
+    destinationSkyId: params.destinationSkyId,
+    fromDate: params.fromDate,
+    toDate: params.toDate,
+    currency: CURRENCY,
+    countryCode: COUNTRY_CODE,
+    market: MARKET,
+  };
+  try {
+    const resp = await axios.get(url, {
+      params: q,
+      headers: getHeaders(apiKey),
+      timeout: 60_000,
+    });
+    const data = resp.data as {
+      status?: boolean;
+      data?: {
+        flights?: {
+          days?: Array<{ day?: string; price?: number; isMonth?: boolean }>;
+        };
+      };
+    };
+    if (!data?.status || !data?.data?.flights?.days) return [];
+    const out: PriceCalendarDay[] = [];
+    for (const d of data.data.flights.days) {
+      if (d && d.day && typeof d.price === "number" && d.price > 0) {
+        out.push({ date: d.day, price: d.price, isMonth: !!d.isMonth });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 export async function searchSkyscannerOneWay(
   apiKey: string,
   params: {
-    fromEntityId: string;
-    toEntityId: string;
-    departDate: string;
+    originSkyId: string;
+    destinationSkyId: string;
+    originEntityId: string;
+    destinationEntityId: string;
+    date: string;
     adults?: number;
     cabinClass?: "economy" | "premium_economy" | "business" | "first";
-    maxEntries?: number;
   }
 ): Promise<SkyscannerFlight[]> {
-  const url = `${BASE}/flights/search-one-way`;
+  const url = `${BASE}/flights/searchFlights`;
   const q: Record<string, unknown> = {
-    fromId: params.fromEntityId,
-    toId: params.toEntityId,
-    departDate: params.departDate,
+    originSkyId: params.originSkyId,
+    destinationSkyId: params.destinationSkyId,
+    originEntityId: params.originEntityId,
+    destinationEntityId: params.destinationEntityId,
+    date: params.date,
     adults: String(params.adults ?? 1),
     cabinClass: params.cabinClass ?? "economy",
     currency: CURRENCY,
+    countryCode: COUNTRY_CODE,
     market: MARKET,
-    locale: LOCALE,
   };
-  const resp = await axios.get(url, {
-    params: q,
-    headers: getHeaders(apiKey),
-    timeout: 60_000,
-  });
-  const data = resp.data as {
-    data?: {
-      itineraries?: SkyscannerFlight[];
+  try {
+    const resp = await axios.get(url, {
+      params: q,
+      headers: getHeaders(apiKey),
+      timeout: 90_000,
+    });
+    const data = resp.data as {
+      status?: boolean;
+      data?: {
+        itineraries?: Array<{
+          id?: string;
+          price?: { raw?: number; formatted?: string };
+          legs?: Array<{
+            id?: string;
+            origin?: { id?: string; iata?: string; name?: string };
+            destination?: { id?: string; iata?: string; name?: string };
+            departure?: string;
+            arrival?: string;
+            durationInMinutes?: number;
+            stopCount?: number;
+            carriers?: Array<{ id?: string; name?: string; iata?: string; marketing?: Array<{ name?: string; iata?: string }> }>;
+          }>;
+          deep_link?: string;
+          bookingOptions?: unknown;
+        }>;
+      };
+      context?: { status?: string; totalItineraries?: number };
     };
-    status?: string;
-  };
-  return (data?.data?.itineraries || []).slice(0, params.maxEntries ?? 15);
+    if (!data?.status || !data?.data?.itineraries) return [];
+    return data.data.itineraries.slice(0, 15).map((it: any) => ({
+      id: it.id,
+      price: it.price?.raw,
+      deep_link: it.deep_link,
+      legs: (it.legs || []).map((leg: any) => ({
+        id: leg.id,
+        origin: leg.origin,
+        destination: leg.destination,
+        departure: leg.departure,
+        arrival: leg.arrival,
+        durationInMinutes: leg.durationInMinutes,
+        stopCount: leg.stopCount,
+        carriers: (leg.carriers?.marketing || leg.carriers || []).map((c: any) => ({
+          name: c.name,
+          iata: c.iata,
+          imageUrl: c.logoUrl || c.imageUrl,
+        })),
+      })),
+    }));
+  } catch {
+    return [];
+  }
 }
 
 export async function searchSkyscannerRoundTripDirect(
   apiKey: string,
   params: {
-    fromEntityId: string;
-    toEntityId: string;
+    originSkyId: string;
+    destinationSkyId: string;
+    originEntityId: string;
+    destinationEntityId: string;
     departDate: string;
     returnDate: string;
     adults?: number;
     cabinClass?: "economy" | "premium_economy" | "business" | "first";
   }
 ): Promise<SkyscannerFlight[]> {
-  const url = `${BASE}/flights/search-roundtrip`;
+  const url = `${BASE}/flights/searchFlights`;
   const q: Record<string, unknown> = {
-    fromId: params.fromEntityId,
-    toId: params.toEntityId,
-    departDate: params.departDate,
+    originSkyId: params.originSkyId,
+    destinationSkyId: params.destinationSkyId,
+    originEntityId: params.originEntityId,
+    destinationEntityId: params.destinationEntityId,
+    date: params.departDate,
     returnDate: params.returnDate,
     adults: String(params.adults ?? 1),
     cabinClass: params.cabinClass ?? "economy",
     currency: CURRENCY,
+    countryCode: COUNTRY_CODE,
     market: MARKET,
-    locale: LOCALE,
   };
-  const resp = await axios.get(url, {
-    params: q,
-    headers: getHeaders(apiKey),
-    timeout: 90_000,
-  });
-  const data = resp.data as {
-    data?: {
-      itineraries?: SkyscannerFlight[];
-    };
-    status?: string;
-  };
-  return data?.data?.itineraries || [];
-}
-
-function firstAirlineIata(f: SkyscannerFlight, legIdx: number): string {
-  const carriers = f.legs?.[legIdx]?.carriers || [];
-  for (const c of carriers) {
-    if (c.iata) return c.iata;
+  try {
+    const resp = await axios.get(url, {
+      params: q,
+      headers: getHeaders(apiKey),
+      timeout: 120_000,
+    });
+    const data = resp.data as any;
+    if (!data?.status || !data?.data?.itineraries) return [];
+    return (data.data.itineraries as any[]).slice(0, 15).map((it: any) => ({
+      id: it.id,
+      price: it.price?.raw,
+      deep_link: it.deep_link,
+      legs: (it.legs || []).map((leg: any) => ({
+        id: leg.id,
+        origin: leg.origin,
+        destination: leg.destination,
+        departure: leg.departure,
+        arrival: leg.arrival,
+        durationInMinutes: leg.durationInMinutes,
+        stopCount: leg.stopCount,
+        carriers: (leg.carriers?.marketing || leg.carriers || []).map((c: any) => ({
+          name: c.name,
+          iata: c.iata,
+          imageUrl: c.logoUrl || c.imageUrl,
+        })),
+      })),
+    }));
+  } catch {
+    return [];
   }
-  return "?";
 }
 
-function collectAirlines(f: SkyscannerFlight): string[] {
+function legCarrierIatas(leg?: SkyscannerFlight["legs"][number]): string[] {
+  if (!leg) return [];
+  const out = new Set<string>();
+  for (const c of leg.carriers || []) {
+    if (c.iata) out.add(c.iata.toUpperCase());
+  }
+  return Array.from(out);
+}
+
+function collectAllAirlines(f: SkyscannerFlight): string[] {
   const set = new Set<string>();
   for (const leg of f.legs || []) {
-    for (const c of leg.carriers || []) {
-      if (c.iata) set.add(c.iata);
-    }
+    for (const iata of legCarrierIatas(leg)) set.add(iata);
   }
   return Array.from(set);
-}
-
-async function _searchFlexibleRoundTripViaRoundTripDirect(
-  apiKey: string,
-  cfg: SearchConfig
-): Promise<SkyscannerRoundTrip[]> {
-  const out: SkyscannerRoundTrip[] = [];
-  const seen = new Set<string>();
-  const today = new Date();
-  const maxDepart = addDays(today, cfg.searchDaysAhead);
-  const stepDays = Math.min(10, Math.max(5, Math.ceil(cfg.searchDaysAhead / 10)));
-  let cur = addDays(today, 7);
-  let iter = 0;
-  while (cur < maxDepart && iter < 6) {
-    iter++;
-    const depart = new Date(cur);
-    const minReturn = addDays(depart, cfg.minNights);
-    const maxReturn = addDays(depart, cfg.maxNights);
-    const tryReturnDates: Date[] = [];
-    let r = new Date(minReturn);
-    while (r <= maxReturn && tryReturnDates.length < 3) {
-      tryReturnDates.push(new Date(r));
-      r = addDays(r, 3);
-    }
-    for (const ret of tryReturnDates) {
-      try {
-        const res = await searchSkyscannerRoundTripDirect(apiKey, {
-          fromEntityId: cfg.flyFrom,
-          toEntityId: cfg.flyTo,
-          departDate: format(depart, "yyyy-MM-dd"),
-          returnDate: format(ret, "yyyy-MM-dd"),
-          adults: cfg.adults,
-        });
-        for (const f of res) {
-          const price = f.price?.amount;
-          if (!price || price <= 0) continue;
-          if (cfg.maxPriceJPY != null && price > cfg.maxPriceJPY) continue;
-          const outLeg = f.legs?.[0];
-          const inLeg = f.legs?.[1] || f.legs?.[0];
-          if (!outLeg) continue;
-          const outAir = firstAirlineIata(f, 0);
-          const retAir = firstAirlineIata(f, 1);
-          if (cfg.selectAirlines.length > 0) {
-            const all = collectAirlines(f);
-            const hasMatch = cfg.selectAirlines.some(
-              (c) => outAir === c || retAir === c || all.includes(c)
-            );
-            if (!hasMatch) continue;
-          }
-          const outDep = outLeg.departure || ret?.toISOString();
-          const outArr = outLeg.arrival || outDep;
-          const retDep = inLeg?.departure || ret?.toISOString();
-          const retArr = inLeg?.arrival || retDep;
-          const outD = new Date(outDep);
-          const retD = new Date(retDep);
-          const nights = Math.max(
-            0,
-            Math.round(
-              (retD.getTime() - outD.getTime()) / (1000 * 60 * 60 * 24)
-            )
-          );
-          if (nights < cfg.minNights || nights > cfg.maxNights) continue;
-          const key = `${format(outD, "yyyyMMdd")}|${format(retD, "yyyyMMdd")}|${outAir}|${retAir}|${Math.floor(price / 1000)}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          out.push({
-            id: key,
-            price: Math.round(price),
-            currency: "JPY",
-            flyFrom: cfg.flyFrom,
-            flyTo: cfg.flyTo,
-            cityFrom: cfg.flyFrom,
-            cityTo: cfg.flyTo,
-            local_departure: outDep,
-            local_arrival: outArr,
-            return_departure: retDep,
-            return_arrival: retArr,
-            airlines: collectAirlines(f).length ? collectAirlines(f) : [outAir, retAir].filter((x) => x && x !== "?"),
-            nightsInDest: nights,
-            deep_link: "",
-            booking_token: f.id || key,
-            route: (f.legs || []).slice(0, 8),
-          });
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-    cur = addDays(cur, stepDays);
-  }
-  return out;
 }
 
 export async function searchRoundTripFlexible(
   apiKey: string,
   cfg: SearchConfig
 ): Promise<SkyscannerRoundTrip[]> {
-  const r = await _searchFlexibleRoundTripViaRoundTripDirect(apiKey, cfg);
-  r.sort((a, b) => a.price - b.price);
-  return r;
+  const out: SkyscannerRoundTrip[] = [];
+  const seen = new Set<string>();
+
+  const fromPlace = await lookupPlace(apiKey, cfg.flyFrom);
+  const toPlace = await lookupPlace(apiKey, cfg.flyTo);
+  if (!fromPlace || !toPlace) return [];
+
+  const today = new Date();
+  const startOut = addDays(today, Math.min(14, Math.max(7, Math.floor(cfg.searchDaysAhead / 6))));
+  const endOut = addDays(today, cfg.searchDaysAhead);
+
+  const startStr = format(startOut, "yyyy-MM-dd");
+  const endStr = format(endOut, "yyyy-MM-dd");
+
+  const outboundCal = await getPriceCalendar(apiKey, {
+    originSkyId: fromPlace.skyId,
+    destinationSkyId: toPlace.skyId,
+    fromDate: startStr,
+    toDate: endStr,
+  });
+
+  outboundCal.sort((a, b) => a.price - b.price);
+  const cheapOutbounds = outboundCal.slice(0, 5);
+
+  let dCandidates: { depart: Date; priceEst: number }[] = [];
+  if (cheapOutbounds.length > 0) {
+    for (const d of cheapOutbounds) {
+      const dt = new Date(d.date + "T00:00:00");
+      if (!isNaN(dt.getTime())) dCandidates.push({ depart: dt, priceEst: d.price });
+    }
+  } else {
+    const step = Math.max(5, Math.ceil(cfg.searchDaysAhead / 6));
+    for (let i = 0; i < 6; i++) {
+      const dt = addDays(startOut, step * i);
+      if (dt > endOut) break;
+      dCandidates.push({ depart: dt, priceEst: 0 });
+    }
+  }
+
+  let apiCallsLeft = 5;
+  if (cfg.mode === "light") apiCallsLeft = 3;
+
+  for (const { depart } of dCandidates) {
+    if (apiCallsLeft <= 0) break;
+    const minReturn = addDays(depart, cfg.minNights);
+    const maxReturn = addDays(depart, cfg.maxNights);
+    const tryReturns: Date[] = [];
+    const midNights = Math.floor((cfg.minNights + cfg.maxNights) / 2);
+    tryReturns.push(addDays(depart, cfg.minNights));
+    tryReturns.push(addDays(depart, midNights));
+    tryReturns.push(addDays(depart, cfg.maxNights));
+    for (const ret of tryReturns) {
+      if (ret < minReturn || ret > maxReturn) continue;
+      if (apiCallsLeft <= 0) break;
+      apiCallsLeft--;
+      const d1 = format(depart, "yyyy-MM-dd");
+      const d2 = format(ret, "yyyy-MM-dd");
+      const flights = await searchSkyscannerRoundTripDirect(apiKey, {
+        originSkyId: fromPlace.skyId,
+        destinationSkyId: toPlace.skyId,
+        originEntityId: fromPlace.entityId,
+        destinationEntityId: toPlace.entityId,
+        departDate: d1,
+        returnDate: d2,
+        adults: cfg.adults,
+      });
+      for (const f of flights) {
+        const price = f.price;
+        if (!price || price <= 0) continue;
+        if (cfg.maxPriceJPY != null && price > cfg.maxPriceJPY) continue;
+        const outLeg = f.legs?.[0];
+        const inLeg = f.legs?.[1];
+        if (!outLeg) continue;
+        const allAir = collectAllAirlines(f);
+        if (cfg.selectAirlines && cfg.selectAirlines.length > 0) {
+          const matched = cfg.selectAirlines.some(
+            (c) => allAir.includes(c.toUpperCase())
+          );
+          if (!matched) continue;
+        }
+        const outDep = outLeg.departure || `${d1}T12:00:00`;
+        const outArr = outLeg.arrival || outDep;
+        const retDep = inLeg?.departure || `${d2}T12:00:00`;
+        const retArr = inLeg?.arrival || retDep;
+        const outD = new Date(outDep);
+        const retD = new Date(retDep);
+        const nights = Math.max(
+          0,
+          Math.round((retD.getTime() - outD.getTime()) / (1000 * 60 * 60 * 24))
+        );
+        if (nights < cfg.minNights || nights > cfg.maxNights) continue;
+        const key = `${format(outD, "yyyyMMdd")}|${format(retD, "yyyyMMdd")}|${allAir.join(
+          ","
+        )}|${Math.floor(price / 1000)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          id: key,
+          price: Math.round(price),
+          currency: "JPY",
+          flyFrom: cfg.flyFrom,
+          flyTo: cfg.flyTo,
+          cityFrom: fromPlace.name || cfg.flyFrom,
+          cityTo: toPlace.name || cfg.flyTo,
+          local_departure: outDep,
+          local_arrival: outArr,
+          return_departure: retDep,
+          return_arrival: retArr,
+          airlines: allAir.length ? allAir : ["?"],
+          nightsInDest: nights,
+          deep_link: f.deep_link || "",
+          booking_token: f.id || key,
+          route: (f.legs || []).slice(0, 8),
+        });
+      }
+    }
+  }
+
+  out.sort((a, b) => a.price - b.price);
+  return out;
 }

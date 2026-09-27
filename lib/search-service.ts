@@ -63,7 +63,7 @@ export interface UnifiedFlight {
   deep_link: string;
   booking_token: string;
   raw: unknown;
-  source: "kiwi" | "serpapi" | "amadeus";
+  source: "kiwi" | "serpapi" | "amadeus" | "skyscanner";
 }
 
 function unifyKiwi(f: KiwiFlight): UnifiedFlight {
@@ -239,6 +239,7 @@ export async function runFullSearch(
   mode: SearchMode = "full"
 ): Promise<SearchResult> {
   const config = cfg ?? loadConfig();
+  config.search.mode = mode;
   const startedAt = new Date().toISOString();
 
   const flights: UnifiedFlight[] = [];
