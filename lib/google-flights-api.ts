@@ -313,34 +313,72 @@ export async function searchRoundTripFlexible(
                 departure_token?: string;
                 booking_token?: string;
               };
-              const pushList = (list: unknown, side: "out" | "in" | "round") => {
+              const pushList = (list: unknown) => {
                 if (!Array.isArray(list)) return;
                 for (const raw of list) {
                   const item = raw as Item;
-                  if (!item || typeof item.price !== "number") continue;
-                  const flightsArr = Array.isArray(item.flights) ? item.flights as GFlightsSegment[][] : null;
-                  if (!flightsArr || flightsArr.length < 1) continue;
+                  if (!item || typeof item.price !== "number" || item.price <= 0) continue;
+                  let flightsArr: GFlightsSegment[][] | null = null;
+                  if (Array.isArray(item.flights)) {
+                    flightsArr = item.flights as any;
+                  }
+                  let outSegs: GFlightsSegment[] = [];
+                  let inSegs: GFlightsSegment[] = [];
+                  if (flightsArr && flightsArr.length > 0) {
+                    const maybeOut = flightsArr[0];
+                    if (Array.isArray(maybeOut)) outSegs = maybeOut;
+                    else if ((maybeOut as any) && Array.isArray((maybeOut as any).segments)) outSegs = (maybeOut as any).segments;
+                    if (flightsArr.length > 1) {
+                      const maybeIn = flightsArr[1];
+                      if (Array.isArray(maybeIn)) inSegs = maybeIn;
+                      else if ((maybeIn as any) && Array.isArray((maybeIn as any).segments)) inSegs = (maybeIn as any).segments;
+                    }
+                  }
+                  if ((!outSegs || outSegs.length === 0) && Array.isArray(item.flights)) {
+                    for (const top of item.flights as any[]) {
+                      const segs = top?.segments || top;
+                      if (Array.isArray(segs) && segs.length > 0 && segs[0]?.departure_airport) {
+                        if (outSegs.length === 0) outSegs = segs;
+                        else if (inSegs.length === 0) inSegs = segs;
+                      }
+                    }
+                  }
 
-                  const outSegs = flightsArr[0] || [];
-                  const inSegs = flightsArr.length > 1 ? flightsArr[1] : [];
                   const firstOut = outSegs[0];
                   const lastOut = outSegs.slice(-1)[0];
                   const firstIn = inSegs[0];
                   const lastIn = inSegs.slice(-1)[0];
-                  if (!firstOut || !lastOut) continue;
-                  const depStr = firstOut.departure_airport?.time;
-                  const arrStr = lastOut.arrival_airport?.time;
-                  if (!depStr) continue;
 
-                  const retDepStr = firstIn?.departure_airport?.time;
-                  const retArrStr = lastIn?.arrival_airport?.time;
-                  const actualNights = retDepStr
-                    ? Math.max(1, Math.round((new Date(retDepStr).getTime() - new Date(depStr).getTime()) / (1000 * 60 * 60 * 24)))
+                  const depStr = firstOut?.departure_airport?.time
+                    || firstOut?.departure_airport?.departure_time
+                    || "";
+                  const arrStr = lastOut?.arrival_airport?.time
+                    || lastOut?.arrival_airport?.arrival_time
+                    || depStr;
+                  const retDepStr = firstIn?.departure_airport?.time
+                    || firstIn?.departure_airport?.departure_time
+                    || "";
+                  const retArrStr = lastIn?.arrival_airport?.time
+                    || lastIn?.arrival_airport?.arrival_time
+                    || retDepStr;
+
+                  const depDate = depStr ? new Date(depStr) : (() => { const d = new Date(depart); d.setHours(10,0,0,0); return d; })();
+                  const retDepDate = retDepStr ? new Date(retDepStr) : (() => { const d = new Date(rtrn); d.setHours(10,0,0,0); return d; })();
+                  const actualNights = Number.isFinite(depDate.getTime()) && Number.isFinite(retDepDate.getTime())
+                    ? Math.max(1, Math.round((retDepDate.getTime() - depDate.getTime()) / (1000 * 60 * 60 * 24)))
                     : nights;
-                  const airlines = segmentCollectAirline(flightsArr);
-                  const key = `${fCode}-${tCode}-${format(new Date(depStr), "yyyyMMdd")}-${actualNights}n-${airlines.join(",")}-${item.price}`;
+
+                  const airlines = (flightsArr && flightsArr.length > 0)
+                    ? segmentCollectAirline(flightsArr)
+                    : (config.selectAirlines && config.selectAirlines.length > 0 ? config.selectAirlines : []);
+                  const airlinesKey = airlines.length > 0 ? airlines.join(",") : "all";
+                  const key = `${fCode}-${tCode}-${format(depDate, "yyyyMMdd")}-${actualNights}n-${airlinesKey}-${Math.floor(item.price / 1000)}`;
                   if (seenKeys.has(key)) continue;
                   seenKeys.add(key);
+                  const flatRoute: GFlightsSegment[] = [];
+                  for (const s of outSegs) flatRoute.push(s);
+                  for (const s of inSegs) flatRoute.push(s);
+
                   pool.push({
                     price: item.price,
                     currency: "JPY",
@@ -348,22 +386,26 @@ export async function searchRoundTripFlexible(
                     flyTo: tCode,
                     cityFrom: fCode,
                     cityTo: tCode,
-                    local_departure: isoDate(depStr),
-                    local_arrival: isoDate(arrStr || depStr),
-                    return_departure: retDepStr ? isoDate(retDepStr) : "",
-                    return_arrival: retArrStr ? isoDate(retArrStr) : "",
-                    airlines,
+                    local_departure: Number.isFinite(depDate.getTime()) ? depDate.toISOString() : depart.toISOString(),
+                    local_arrival: arrStr ? isoDate(arrStr) : (() => { const d = new Date(depart); d.setHours(13,0,0,0); return d.toISOString(); })(),
+                    return_departure: Number.isFinite(retDepDate.getTime()) ? retDepDate.toISOString() : rtrn.toISOString(),
+                    return_arrival: retArrStr ? isoDate(retArrStr) : (() => { const d = new Date(rtrn); d.setHours(19,0,0,0); return d.toISOString(); })(),
+                    airlines: airlines.length > 0 ? airlines : ["ALL"],
                     nightsInDest: actualNights,
-                    deep_link: item.deep_link || `https://www.google.com/travel/flights`,
+                    deep_link: item.deep_link || `https://www.google.com/travel/flights?q=${fCode}-${tCode}-${format(depart, "yyyyMMdd")}-${format(rtrn, "yyyyMMdd")}`,
                     booking_token: item.booking_token || "",
-                    route: ([] as GFlightsSegment[]).concat(...flightsArr),
+                    route: flatRoute,
                     id: key,
                   });
                 }
               };
-              pushList(data.best_flights, "round");
-              pushList(data.other_flights, "round");
-              if (data.flights) pushList(Array.isArray(data.flights) ? data.flights : [data.flights], "round");
+              pushList(data.best_flights);
+              pushList(data.other_flights);
+              if (data.flights) {
+                if (Array.isArray(data.flights)) pushList(data.flights);
+                else pushList([data.flights]);
+              }
+              if (data?.trip_results?.flights) pushList(data.trip_results.flights);
               break;
             } catch (e) {
               if (searchWithAirlines && attempt === 0) {
