@@ -210,23 +210,29 @@ export async function searchRoundTripFlexible(
   const maxDeparture = addDays(today, config.searchDaysAhead);
   const windows: Array<{ start: Date; end: Date }> = [];
   const totalDays = config.searchDaysAhead;
+  const isLight = config.mode === "light";
+
   let cur = new Date(today);
-  const stepDays = Math.min(14, Math.max(7, Math.ceil(totalDays / 8)));
-  while (cur < maxDeparture) {
-    const end = addDays(cur, stepDays);
-    windows.push({
-      start: new Date(cur),
-      end: end < maxDeparture ? end : new Date(maxDeparture),
-    });
-    cur = addDays(cur, stepDays + 1);
+  if (isLight) {
+    const start = addDays(today, Math.min(14, Math.max(10, Math.floor(config.searchDaysAhead / 5))));
+    const end = addDays(start, Math.min(21, Math.ceil(config.searchDaysAhead / 3)));
+    windows.push({ start, end: end < maxDeparture ? end : new Date(maxDeparture) });
+  } else {
+    const stepDays = Math.min(14, Math.max(7, Math.ceil(totalDays / 5)));
+    while (cur < maxDeparture && windows.length < 2) {
+      const end = addDays(cur, stepDays);
+      windows.push({
+        start: new Date(cur),
+        end: end < maxDeparture ? end : new Date(maxDeparture),
+      });
+      cur = addDays(cur, stepDays + 1);
+    }
   }
 
   const fromCandidates: string[] = [];
   const toCandidates: string[] = [];
   const fromUpper = config.flyFrom.toUpperCase();
   const toUpper = config.flyTo.toUpperCase();
-  fromCandidates.push(fromUpper);
-  toCandidates.push(toUpper);
   const cityExpansions: Record<string, string[]> = {
     TYO: ["NRT", "HND"],
     SFO: ["SFO", "OAK", "SJC"],
@@ -237,27 +243,37 @@ export async function searchRoundTripFlexible(
     PAR: ["CDG", "ORY"],
     LON: ["LHR", "LGW", "STN"],
     SEL: ["ICN", "GMP"],
-    SHA: ["PVG", "SHA", "PVG"],
+    SHA: ["PVG", "SHA"],
     SPK: ["CTS", "SPK"],
     OSA: ["KIX", "ITM"],
   };
   for (const c of cityExpansions[fromUpper] || []) {
     if (!fromCandidates.includes(c)) fromCandidates.push(c);
   }
+  fromCandidates.push(fromUpper);
   for (const c of cityExpansions[toUpper] || []) {
     if (!toCandidates.includes(c)) toCandidates.push(c);
   }
+  toCandidates.push(toUpper);
 
   const pool: RoundTripSearchResult[] = [];
   const seenKeys = new Set<string>();
+  const maxOutboundsPerWindow = isLight ? 3 : 6;
+  const maxReturnsPerOutbound = isLight ? 3 : 6;
+  const maxFlightApiCalls = isLight ? 10 : 20;
+  let apiCallCount = 0;
 
-  for (let wIdx = 0; wIdx < Math.min(windows.length, 5); wIdx++) {
+  for (let wIdx = 0; wIdx < windows.length; wIdx++) {
     const w = windows[wIdx];
     try {
       let outbounds: GFlightsOption[] = [];
+      outer:
       for (const fCode of fromCandidates) {
         for (const tCode of toCandidates) {
+          if (apiCallCount >= maxFlightApiCalls) break outer;
+          if (outbounds.length >= 20) break outer;
           try {
+            apiCallCount++;
             let outs = await searchGoogleFlightsOneWay({
               api_key: apiKey,
               departure_id: fCode,
@@ -274,31 +290,33 @@ export async function searchRoundTripFlexible(
               hl: "ja",
             });
             if (outs.length === 0 && config.selectAirlines.length > 0) {
-              outs = await searchGoogleFlightsOneWay({
-                api_key: apiKey,
-                departure_id: fCode,
-                arrival_id: tCode,
-                outbound_date_start: w.start,
-                outbound_date_end: w.end,
-                maxPrice: config.maxPriceJPY ?? undefined,
-                adults: config.adults,
-                currency: "JPY",
-                hl: "ja",
-              });
+              if (apiCallCount < maxFlightApiCalls) {
+                apiCallCount++;
+                outs = await searchGoogleFlightsOneWay({
+                  api_key: apiKey,
+                  departure_id: fCode,
+                  arrival_id: tCode,
+                  outbound_date_start: w.start,
+                  outbound_date_end: w.end,
+                  maxPrice: config.maxPriceJPY ?? undefined,
+                  adults: config.adults,
+                  currency: "JPY",
+                  hl: "ja",
+                });
+              }
             }
             if (outs.length > 0) outbounds.push(...outs);
-            if (outbounds.length >= 20) break;
           } catch {
             /* ignore per city-pair error */
           }
         }
-        if (outbounds.length >= 20) break;
       }
 
       if (outbounds.length === 0) continue;
 
-      const outCandidates = outbounds.slice(0, 8);
+      const outCandidates = outbounds.slice(0, maxOutboundsPerWindow);
       for (let i = 0; i < outCandidates.length; i++) {
+        if (apiCallCount >= maxFlightApiCalls) break;
         const out = outCandidates[i];
         const outFirstLeg = out.flights[0]?.[0];
         const outLastLegLastSeg =
@@ -318,9 +336,13 @@ export async function searchRoundTripFlexible(
           returnEnd < windowEnd ? returnEnd : windowEnd;
 
         let returns: GFlightsOption[] = [];
+        outerRet:
         for (const rFrom of toCandidates) {
           for (const rTo of fromCandidates) {
+            if (apiCallCount >= maxFlightApiCalls) break outerRet;
+            if (returns.length >= 20) break outerRet;
             try {
+              apiCallCount++;
               let r = await searchGoogleFlightsOneWay({
                 api_key: apiKey,
                 departure_id: rFrom,
@@ -338,7 +360,8 @@ export async function searchRoundTripFlexible(
                 currency: "JPY",
                 hl: "ja",
               });
-              if (r.length === 0 && config.selectAirlines.length > 0) {
+              if (r.length === 0 && config.selectAirlines.length > 0 && apiCallCount < maxFlightApiCalls) {
+                apiCallCount++;
                 r = await searchGoogleFlightsOneWay({
                   api_key: apiKey,
                   departure_id: rFrom,
@@ -354,15 +377,13 @@ export async function searchRoundTripFlexible(
                 });
               }
               if (r.length > 0) returns.push(...r);
-              if (returns.length >= 20) break;
             } catch {
               /* ignore */
             }
           }
-          if (returns.length >= 20) break;
         }
 
-        for (let j = 0; j < Math.min(returns.length, 10); j++) {
+        for (let j = 0; j < Math.min(returns.length, maxReturnsPerOutbound); j++) {
           const ret = returns[j];
           const retFirstLeg = ret.flights[0]?.[0];
           const retLastLegLastSeg =

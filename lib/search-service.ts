@@ -255,47 +255,78 @@ export async function runFullSearch(
   const useKiwi =
     !!config.kiwiApiKey && !config.kiwiApiKey.includes("your_kiwi");
 
-  try {
-    if (useSky) {
-      await collectSky(config, flights, errors);
-      if (flights.some((f) => f.source === "skyscanner"))
-        providerSet.add("skyscanner");
+  const softLimit = mode === "light" ? 3 : 5;
+
+  const deadlineMs = mode === "light" ? 5500 : 7000;
+  const startedMs = Date.now();
+  const timeLeft = () => Math.max(500, deadlineMs - (Date.now() - startedMs));
+
+  const tryCollect = async (
+    label: string,
+    fn: () => Promise<void>,
+    stopCondition: () => boolean
+  ) => {
+    if (timeLeft() < 1000) return;
+    if (stopCondition()) return;
+    try {
+      await Promise.race([
+        fn(),
+        new Promise<void>((r) => setTimeout(r, timeLeft())),
+      ]);
+    } catch (e) {
+      errors.push(`${label}: ${e instanceof Error ? e.message : String(e)}`);
     }
-  } catch {
-    /* ignore outer */
+  };
+
+  if (useSky) {
+    await tryCollect(
+      "Skyscanner",
+      async () => {
+        await collectSky(config, flights, errors);
+        if (flights.some((f) => f.source === "skyscanner"))
+          providerSet.add("skyscanner");
+      },
+      () => flights.length >= softLimit
+    );
   }
 
-  try {
-    if (useSerp && flights.length < 15) {
-      await collectSerp(config, flights, errors);
-      if (flights.some((f) => f.source === "serpapi"))
-        providerSet.add("serpapi");
-    }
-  } catch {
-    /* ignore outer */
+  if (useSerp && flights.length < softLimit) {
+    await tryCollect(
+      "SerpAPI",
+      async () => {
+        await collectSerp(config, flights, errors);
+        if (flights.some((f) => f.source === "serpapi"))
+          providerSet.add("serpapi");
+      },
+      () => flights.length >= Math.max(softLimit + 2, 8)
+    );
   }
 
-  try {
-    if (
-      useAmadeus &&
-      (mode === "light" || flights.length < 5)
-    ) {
-      await collectAmadeus(config, flights, errors, mode);
-      if (flights.some((f) => f.source === "amadeus"))
-        providerSet.add("amadeus");
-    }
-  } catch {
-    /* ignore outer */
+  if (
+    useAmadeus &&
+    (mode === "light" || flights.length < 5)
+  ) {
+    await tryCollect(
+      "Amadeus",
+      async () => {
+        await collectAmadeus(config, flights, errors, mode);
+        if (flights.some((f) => f.source === "amadeus"))
+          providerSet.add("amadeus");
+      },
+      () => flights.length >= Math.max(softLimit + 3, 10)
+    );
   }
 
-  try {
-    if (useKiwi && flights.length < 5) {
-      await collectKiwi(config, flights, errors);
-      if (flights.some((f) => f.source === "kiwi"))
-        providerSet.add("kiwi");
-    }
-  } catch {
-    /* ignore outer */
+  if (useKiwi && flights.length < 5) {
+    await tryCollect(
+      "Kiwi",
+      async () => {
+        await collectKiwi(config, flights, errors);
+        if (flights.some((f) => f.source === "kiwi"))
+          providerSet.add("kiwi");
+      },
+      () => flights.length >= Math.max(softLimit + 3, 10)
+    );
   }
 
   flights.sort((a, b) => a.priceJPY - b.priceJPY);
