@@ -99,12 +99,40 @@ export async function GET() {
         mode: "light" as const,
       };
       const r = await serpSearch(cfg.serpApiKey, searchCfg);
-      out.test.serpapi_light_NRT_DLC = {
+      out.test.serpapi_light_NRT_DLC_roundtrip = {
         count: r.length,
-        sample: r.slice(0, 3).map((f: any) => ({ price: f.price, airlines: f.airlines, nights: f.nightsInDest })),
+        sample: r.slice(0, 3).map((f: any) => ({ price: f.price, airlines: f.airlines, nightsInDest: f.nightsInDest, depart: f.local_departure?.slice(0,10), returnDepart: f.return_departure?.slice(0,10) })),
       };
     } catch (e: any) {
-      out.test.serpapi_light_NRT_DLC = {
+      out.test.serpapi_light_NRT_DLC_roundtrip = {
+        ok: false,
+        error: e?.message || String(e),
+        stack: e?.stack?.slice(0, 300),
+      };
+    }
+
+    try {
+      const { searchGoogleFlightsOneWay } = await import("@/lib/google-flights-api");
+      const specificDay = new Date();
+      specificDay.setDate(specificDay.getDate() + 21);
+      const outs = await searchGoogleFlightsOneWay({
+        api_key: cfg.serpApiKey,
+        departure_id: "NRT",
+        arrival_id: "DLC",
+        outbound_date_specific: specificDay,
+        currency: "JPY",
+        hl: "ja",
+        adults: 1,
+        travelType: "one_way",
+      } as any);
+      out.test.serpapi_NRT_DLC_specificOneway = {
+        testDate: format(specificDay, "yyyy-MM-dd"),
+        count: outs.length,
+        samplePrice: outs[0]?.price,
+        sampleCountAll: outs.length,
+      };
+    } catch (e: any) {
+      out.test.serpapi_NRT_DLC_specificOneway = {
         ok: false,
         error: e?.message || String(e),
         stack: e?.stack?.slice(0, 300),
