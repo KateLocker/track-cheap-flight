@@ -516,44 +516,65 @@ export async function searchSerpapiRoundTripHard(
   const seenKeys = new Set<string>();
   const pool: GFlightsOption[] = [];
 
-  // 1. 生成 6~8个关键出发日
+  // 1. 生成 8个关键出发日：优先从 TODAY+14 天开始（淡季机票便宜，ANA常有促销），覆盖10月底~12月
+  // 之前从TODAY+7天只搜了10月初旺季，10万+的票都是10月初的！真正¥5.3万在10月中旬之后！
   const departCandidates: Date[] = [];
   const firstDepart = new Date();
-  firstDepart.setDate(firstDepart.getDate() + 7);
+  firstDepart.setDate(firstDepart.getDate() + 14); // 从14天后开始搜！（最近两周票贵！）
   const lastDepart = new Date();
-  lastDepart.setDate(lastDepart.getDate() + Math.max(14, Math.min(searchDaysAhead, 120)));
-  const totalDays = Math.max(7, Math.round((lastDepart.getTime() - firstDepart.getTime()) / 86400000));
-  const numDepartPoints = Math.min(8, Math.max(4, Math.ceil(totalDays / 14)));
+  lastDepart.setDate(lastDepart.getDate() + Math.max(30, Math.min(searchDaysAhead, 150))); // 最多到150天后
+  const totalDays = Math.max(14, Math.round((lastDepart.getTime() - firstDepart.getTime()) / 86400000));
+  const numDepartPoints = Math.max(6, Math.min(10, Math.ceil(totalDays / 10))); // 至少6个出发日，最多10个！
   const departStep = Math.max(7, Math.ceil(totalDays / numDepartPoints));
   for (let i = 0; i < numDepartPoints; i++) {
     departCandidates.push(addDays(firstDepart, i * departStep));
   }
 
-  // 2. 泊数：min / 中间 / max
+  // 2. 泊数：至少5个点均匀分布！（含7泊/10泊 — 中日航线往返最常见、ANA促销最多）
+  // 固定3个点太少！之前3泊~21泊只搜了3/12/21，完全漏掉了7/10！¥5.3万就是7泊！
   const nightCandidates: number[] = [];
+  const nightPopular = [7, 10, 5, 14, 4, 3, 11, 8]; // 先放最常见的7/10泊！
   nightCandidates.push(minNights);
-  const mid = Math.round((minNights + maxNights) / 2);
-  if (mid !== minNights && mid !== maxNights) nightCandidates.push(mid);
-  if (maxNights !== minNights && maxNights !== mid) nightCandidates.push(maxNights);
-  if (nightCandidates.length < 3) {
-    if (!nightCandidates.includes(7) && 7 >= minNights && 7 <= maxNights) nightCandidates.push(7);
-    if (!nightCandidates.includes(10) && 10 >= minNights && 10 <= maxNights) nightCandidates.push(10);
+  nightCandidates.push(maxNights);
+  const mid1 = Math.round((minNights + maxNights) / 2);
+  if (mid1 !== minNights && mid1 !== maxNights) nightCandidates.push(mid1);
+  for (const p of nightPopular) {
+    if (p >= minNights && p <= maxNights && !nightCandidates.includes(p)) {
+      nightCandidates.push(p);
+    }
+    if (nightCandidates.length >= 6) break;
   }
-  nightCandidates.length = Math.min(3, nightCandidates.length);
+  // 去重+保持7泊/10泊在最前面！
+  const seenN = new Set<number>();
+  const sortedNights: number[] = [];
+  const priorityFirst = [7, 10];
+  for (const n of priorityFirst) if (nightCandidates.includes(n) && !seenN.has(n)) { seenN.add(n); sortedNights.push(n); }
+  for (const n of nightCandidates) if (!seenN.has(n)) { seenN.add(n); sortedNights.push(n); }
+  sortedNights.length = Math.min(6, sortedNights.length);
+  nightCandidates.length = 0;
+  for (const n of sortedNights) nightCandidates.push(n);
 
   // 3. 生成组合：from × depart × nights × to
-  type Comb = { f: string; t: string; depart: Date; nights: number; rtrn: Date };
+  // 排序：先7/10泊（促销多）+ 出发日期早的，先搜最便宜可能的组合！搜到<¥7万立刻停！
+  type Comb = { f: string; t: string; depart: Date; nights: number; rtrn: Date; priority: number };
   const combos: Comb[] = [];
   for (const f of fromAirports) {
     for (const t of toAirports) {
       for (const d of departCandidates) {
-        for (const n of nightCandidates) {
-          combos.push({ f, t, depart: d, nights: n, rtrn: addDays(d, n) });
+        for (let i = 0; i < nightCandidates.length; i++) {
+          const n = nightCandidates[i];
+          combos.push({
+            f, t,
+            depart: d,
+            nights: n,
+            rtrn: addDays(d, n),
+            priority: i + Math.floor((d.getTime() - firstDepart.getTime()) / (86400000 * departStep)) * 100, // 泊数优先级（i越小越高） + 出发日期越早越高
+          });
         }
       }
     }
   }
-  combos.sort((a, b) => a.depart.getTime() - b.depart.getTime());
+  combos.sort((a, b) => a.priority - b.priority); // 先搜最便宜的组合！
   const finalCombos = combos.slice(0, Math.min(maxCalls, combos.length));
 
   const isoDate = (s: string) => new Date(s).toISOString();
