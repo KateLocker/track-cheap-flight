@@ -3,7 +3,8 @@ import { format, addDays } from "date-fns";
 import type { SearchConfig } from "./config";
 
 export interface GFlightsSegment {
-  airline_code: string;
+  airline_code?: string;
+  airline?: string;
   flight_number?: string;
   departure_airport?: { id?: string; name?: string; time?: string };
   arrival_airport?: { id?: string; name?: string; time?: string };
@@ -206,6 +207,11 @@ export interface RoundTripSearchResult {
   booking_token: string;
   route: GFlightsSegment[];
   id: string;
+}
+
+export interface HardSearchResult extends RoundTripSearchResult {
+  flights: unknown[];
+  raw?: unknown;
 }
 
 function isoDate(s: string): string {
@@ -493,7 +499,7 @@ export async function searchSerpapiRoundTripHard(
     silent?: boolean;
   },
   onProgress?: (msg: string) => void
-): Promise<GFlightsOption[]> {
+): Promise<HardSearchResult[]> {
   const {
     api_key,
     fromAirports,
@@ -514,7 +520,7 @@ export async function searchSerpapiRoundTripHard(
     silent = false,
   } = params;
   const seenKeys = new Set<string>();
-  const pool: GFlightsOption[] = [];
+  const pool: HardSearchResult[] = [];
 
   // 1. 生成 8个关键出发日：优先从 TODAY+14 天开始（淡季机票便宜，ANA常有促销），覆盖10月底~12月
   // 之前从TODAY+7天只搜了10月初旺季，10万+的票都是10月初的！真正¥5.3万在10月中旬之后！
@@ -580,14 +586,28 @@ export async function searchSerpapiRoundTripHard(
   const isoDate = (s: string) => new Date(s).toISOString();
   const segmentCollectAirline = (fl: any): string[] => {
     const s = new Set<string>();
-    const arrs = Array.isArray(fl) ? fl : [fl];
-    for (const arr of arrs) {
-      if (Array.isArray(arr)) {
-        for (const seg of arr) {
-          if (seg?.airline_code) s.add(String(seg.airline_code));
-        }
+    const visit = (seg: any): void => {
+      if (Array.isArray(seg)) {
+        seg.forEach(visit);
+        return;
       }
-    }
+      if (!seg || typeof seg !== "object") return;
+      if (Array.isArray(seg.segments)) {
+        visit(seg.segments);
+        return;
+      }
+      const explicit = [seg.airline_code, seg.airline?.code, seg.marketing_airline_code]
+        .find(v => typeof v === "string" && /^[A-Z0-9]{2}$/i.test(v.trim()));
+      const number = seg.flight_number || seg.marketing_flight_number;
+      const prefix = typeof number === "string"
+        ? number.trim().toUpperCase().match(/^([A-Z0-9]{2})\s*\d/)?.[1]
+        : undefined;
+      const code = explicit?.trim().toUpperCase() || prefix;
+      const name = typeof seg.airline === "string" ? seg.airline.trim() : "";
+      if (code) s.add(code);
+      else if (name && name.toUpperCase() !== "ALL") s.add(name);
+    };
+    visit(fl);
     return Array.from(s);
   };
 
@@ -634,10 +654,15 @@ export async function searchSerpapiRoundTripHard(
             if (typeof maxPrice === "number" && maxPrice > 0 && item.price > maxPrice) continue;
 
             let flightsArr: any = Array.isArray(item.flights) ? item.flights : null;
+            // #region debug-point A:input-shape
+            if (process.env.DEBUG_SERVER_URL) void fetch(process.env.DEBUG_SERVER_URL, { method: "POST", body: JSON.stringify({ sessionId: "airline-all", runId: process.env.DEBUG_RUN_ID || "pre-fix", hypothesisId: "A", location: "hard-search:input", msg: "[DEBUG] Flight shape", data: { firstKeys: Object.keys(flightsArr?.[0] || {}), flightNumber: flightsArr?.[0]?.flight_number }, ts: Date.now() }) }).catch(() => {});
+            // #endregion
             let outSegs: any[] = [];
             let inSegs: any[] = [];
             if (flightsArr && flightsArr.length > 0) {
-              if (Array.isArray(flightsArr[0])) outSegs = flightsArr[0];
+              // A flat list contains the outbound journey's connections, not return legs.
+              if (!Array.isArray(flightsArr[0]) && !Array.isArray(flightsArr[0]?.segments)) outSegs = flightsArr;
+              else if (Array.isArray(flightsArr[0])) outSegs = flightsArr[0];
               else if (flightsArr[0] && Array.isArray(flightsArr[0].segments)) outSegs = flightsArr[0].segments;
               if (flightsArr.length > 1) {
                 if (Array.isArray(flightsArr[1])) inSegs = flightsArr[1];
@@ -666,39 +691,17 @@ export async function searchSerpapiRoundTripHard(
             const retDepDate = retDepStr ? new Date(retDepStr) : (() => { const d = new Date(c.rtrn); d.setHours(10,0,0,0); return d; })();
             const actualNights = Number.isFinite(depDate.getTime()) && Number.isFinite(retDepDate.getTime())
               ? Math.max(1, Math.round((retDepDate.getTime() - depDate.getTime()) / 86400000)) : c.nights;
-            // 🚨 真实航司解析：从 outSegs/inSegs（实际拿到的航段）里拿 airline_code！优先！
-            // 之前用 flightsArr 但如果item.flights结构复杂或者没解析到flightsArr，就返回ALL导致用户不知道是哪家航司！
-            const collectFromSegs = (segs: any[]): string[] => {
-              const s = new Set<string>();
-              if (!segs) return [];
-              for (const seg of segs) {
-                if (!seg) continue;
-                if (seg.airline_code) s.add(String(seg.airline_code));
-                if (seg.airline && typeof seg.airline === "object" && seg.airline.code) s.add(String(seg.airline.code));
-                if (seg.marketing_airline_code) s.add(String(seg.marketing_airline_code));
-                if (seg.marketing_flight_number && seg.marketing_flight_number.slice) {
-                  const prefix = seg.marketing_flight_number.slice(0, 2).toUpperCase();
-                  if (/^[A-Z]{2}$/.test(prefix)) s.add(prefix);
-                }
-                if (seg.flight_number && seg.flight_number.slice) {
-                  const prefix = seg.flight_number.slice(0, 2).toUpperCase();
-                  if (/^[A-Z]{2}$/.test(prefix)) s.add(prefix);
-                }
-              }
-              return Array.from(s);
-            };
-            const fromSegs = collectFromSegs(outSegs).concat(collectFromSegs(inSegs));
+            const fromSegs = segmentCollectAirline([outSegs, inSegs]);
+            // #region debug-point B:parsed-segments
+            if (process.env.DEBUG_SERVER_URL) void fetch(process.env.DEBUG_SERVER_URL, { method: "POST", body: JSON.stringify({ sessionId: "airline-all", runId: process.env.DEBUG_RUN_ID || "pre-fix", hypothesisId: "B", location: "hard-search:parsed", msg: "[DEBUG] Parsed airlines", data: { outCount: outSegs.length, inCount: inSegs.length, airlines: fromSegs }, ts: Date.now() }) }).catch(() => {});
+            // #endregion
             const fromFlightsArr = (flightsArr && flightsArr.length > 0) ? segmentCollectAirline(flightsArr) : [];
             const fromItemRaw = Array.isArray(item.airlines) ? item.airlines.map((a: any) => typeof a === "string" ? a : (a?.code || a?.name || "")).filter(Boolean) : [];
             const airlines = [];
             const seenA = new Set<string>();
             for (const a of fromSegs) { const k = String(a).toUpperCase(); if (!seenA.has(k)) { seenA.add(k); airlines.push(String(a)); } }
             for (const a of fromFlightsArr) { const k = String(a).toUpperCase(); if (!seenA.has(k)) { seenA.add(k); airlines.push(String(a)); } }
-            for (const a of fromItemRaw) { const k = String(a).toUpperCase(); if (!seenA.has(k) && k && k !== "UNDEFINED") { seenA.add(k); airlines.push(String(a)); } }
-            if (airlines.length === 0) {
-              if (airlineCodes && airlineCodes.length > 0) airlines.push(...airlineCodes.slice());
-              else airlines.push("ALL");
-            }
+            for (const a of fromItemRaw) { const k = String(a).toUpperCase(); if (!seenA.has(k) && k && k !== "UNDEFINED" && k !== "ALL") { seenA.add(k); airlines.push(String(a)); } }
             if (filterAirlines && airlineCodes && airlineCodes.length > 0) {
               const inList = airlines.some((a: string) => airlineCodes.includes(String(a).toUpperCase()));
               if (!inList) continue;
@@ -723,7 +726,7 @@ export async function searchSerpapiRoundTripHard(
               local_arrival: arrStr ? isoDate(arrStr) : new Date(depDate.getTime() + 3 * 3600 * 1000).toISOString(),
               return_departure: Number.isFinite(retDepDate.getTime()) ? retDepDate.toISOString() : c.rtrn.toISOString(),
               return_arrival: retArrStr ? isoDate(retArrStr) : new Date(retDepDate.getTime() + 3 * 3600 * 1000).toISOString(),
-              airlines: airlines.length > 0 ? airlines : ["ALL"],
+              airlines,
               nightsInDest: actualNights,
               deep_link: item.deep_link || `https://www.google.com/travel/flights?q=${c.f}${c.t}${format(c.depart,"yyyyMMdd")}${format(c.rtrn,"yyyyMMdd")}`,
               booking_token: item.booking_token || "",
@@ -772,8 +775,11 @@ export async function searchSerpapiRoundTripHard(
               let outSegs: any[] = [];
               let inSegs: any[] = [];
               if (flightsArr && flightsArr.length > 0) {
-                if (Array.isArray(flightsArr[0])) outSegs = flightsArr[0];
+                if (!Array.isArray(flightsArr[0]) && !Array.isArray(flightsArr[0]?.segments)) outSegs = flightsArr;
+                else if (Array.isArray(flightsArr[0])) outSegs = flightsArr[0];
+                else outSegs = flightsArr[0].segments;
                 if (flightsArr.length > 1 && Array.isArray(flightsArr[1])) inSegs = flightsArr[1];
+                else if (Array.isArray(flightsArr?.[1]?.segments)) inSegs = flightsArr[1].segments;
               }
               const firstOut = outSegs[0];
               const firstIn = inSegs[0];
@@ -785,7 +791,7 @@ export async function searchSerpapiRoundTripHard(
                 ? Math.max(1, Math.round((retDepDate.getTime() - depDate.getTime()) / 86400000)) : c.nights;
               const airlines = (flightsArr && flightsArr.length > 0)
                 ? segmentCollectAirline(flightsArr)
-                : ["ALL"];
+                : [];
               if (filterAirlines) {
                 const inList = airlines.some((a: string) => airlineCodes.includes(a));
                 if (!inList) continue;
@@ -809,7 +815,7 @@ export async function searchSerpapiRoundTripHard(
                 local_arrival: new Date(depDate.getTime() + 3 * 3600 * 1000).toISOString(),
                 return_departure: retDepDate.toISOString(),
                 return_arrival: new Date(retDepDate.getTime() + 3 * 3600 * 1000).toISOString(),
-                airlines: airlines.length > 0 ? airlines : ["ALL"],
+                airlines,
                 nightsInDest: actualNights,
                 deep_link: item.deep_link || `https://www.google.com/travel/flights?q=${c.f}${c.t}${format(c.depart,"yyyyMMdd")}${format(c.rtrn,"yyyyMMdd")}`,
                 booking_token: item.booking_token || "",

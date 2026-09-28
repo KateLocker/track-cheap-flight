@@ -44,10 +44,17 @@ const AIRLINE_NAMES: Record<string, string> = {
   "9C": "春秋航空",
   ZH: "深圳航空",
   MF: "厦門航空",
+  OZ: "アシアナ航空 (韩亚航空)",
+  KE: "大韓航空",
 };
 
 export function getAirlineName(code: string): string {
-  return AIRLINE_NAMES[code] || code;
+  return code.split(",").map(c => {
+    const value = c.trim();
+    return !value || value === "ALL" || value === "?"
+      ? "航空会社未確認"
+      : AIRLINE_NAMES[value] || value;
+  }).join(" / ");
 }
 
 export interface UnifiedFlight {
@@ -92,7 +99,12 @@ function unifyKiwi(f: KiwiFlight): UnifiedFlight {
 
 export function unifySerp(f: RoundTripSearchResult): UnifiedFlight {
   const airlineCode =
-    serpAirlines(f).split(",")[0] || f.airlines[0] || "?";
+    Array.from(new Set(serpAirlines(f).split(",")
+      .map(code => code.trim())
+      .filter(code => code && code !== "ALL" && code !== "?"))).join(",") || "?";
+  // #region debug-point C:unified-airlines
+  if (process.env.DEBUG_SERVER_URL) void fetch(process.env.DEBUG_SERVER_URL, { method: "POST", body: JSON.stringify({ sessionId: "airline-all", runId: process.env.DEBUG_RUN_ID || "pre-fix", hypothesisId: "C", location: "unifySerp", msg: "[DEBUG] Unified airline", data: { input: f.airlines, output: airlineCode }, ts: Date.now() }) }).catch(() => {});
+  // #endregion
   return {
     id: `serp-${f.id}`,
     priceJPY: f.price,
@@ -229,8 +241,7 @@ async function collectSerp(
     } else {
       // 先过滤符合selectAirlines的
       const filtered = allUnified.filter(f => {
-        if (!f.airlines || f.airlines.length === 0) return true;
-        return f.airlines.some(a => wantsAirlines.includes(String(a).toUpperCase()));
+        return f.airlineCode.split(",").some(a => wantsAirlines.includes(a.toUpperCase()));
       });
       // 如果过滤后>=3条 → 只带过滤的
       if (filtered.length >= 3) {
@@ -239,12 +250,12 @@ async function collectSerp(
         // <3条 → 过滤的放前面，然后全量的补齐到15条
         const seen = new Set<string>();
         for (const f of filtered) {
-          seen.add(f.id || `${f.flyFrom}-${f.flyTo}-${f.local_departure}-${f.priceJPY}`);
+          seen.add(f.id || `${f.flyFrom}-${f.flyTo}-${f.departureAt}-${f.priceJPY}`);
           flights.push(f);
         }
         for (const f of allUnified) {
           if (flights.length >= 15) break;
-          const key = f.id || `${f.flyFrom}-${f.flyTo}-${f.local_departure}-${f.priceJPY}`;
+          const key = f.id || `${f.flyFrom}-${f.flyTo}-${f.departureAt}-${f.priceJPY}`;
           if (seen.has(key)) continue;
           seen.add(key);
           flights.push(f);

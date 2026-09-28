@@ -91,13 +91,14 @@ export async function GET() {
   }
 
   const elapsed = Date.now() - startedAt;
-  const sample5 = serpAllAirlines.slice(0, 5).map(f => ({
+  const sample5 = serpAllAirlines.slice(0, 5).map((f, index) => ({
     priceJPY: f?.priceJPY,
     from: f?.flyFrom, to: f?.flyTo,
-    dep: f?.local_departure?.slice(0, 10),
-    ret: f?.return_departure?.slice(0, 10),
+    dep: f?.departureAt?.slice(0, 10),
+    ret: f?.returnAt?.slice(0, 10),
     nights: f?.nightsInDest,
-    airlines: f?.airlines,
+    airlines: rawResults[index]?.airlines,
+    rawAirlineFields: collectAirlineKeys(rawResults[index]?.flights, "flights"),
     airlineCode: f?.airlineCode,
     source: f?.source,
   }));

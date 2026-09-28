@@ -623,6 +623,10 @@ export default function HomePage() {
         <h2 className="text-xl font-bold text-primary-800 mb-4 flex items-center gap-2">
           🔥 最近の格安往復（上位15件）
         </h2>
+        <p className="text-xs text-primary-700/70 mb-3">
+          取得できた航段の航空会社を表示しています。復路・運航会社は予約画面でご確認ください。
+          指定した航空会社の候補が少ない場合、他社の候補も含みます。
+        </p>
         {uniqueRoutes.length > 0 ? (
           <div className="overflow-x-auto -mx-2">
             <table className="w-full text-sm">
@@ -656,7 +660,11 @@ export default function HomePage() {
                       {fmtDate(f.return_at)}
                     </td>
                     <td className="px-3 py-3">{f.nights_in_dest}</td>
-                    <td className="px-3 py-3">{f.airline}</td>
+                    <td className="px-3 py-3">
+                      {!f.airline || f.airline === "ALL" || f.airline === "?"
+                        ? "航空会社未確認"
+                        : `${f.airline_name || f.airline} (${f.airline})`}
+                    </td>
                     <td className="px-3 py-3 text-xs text-primary-700/60 whitespace-nowrap">
                       {timeAgo(f.created_at)}
                     </td>
