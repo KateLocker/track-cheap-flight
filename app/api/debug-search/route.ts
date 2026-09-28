@@ -58,6 +58,7 @@ export async function GET() {
     ret: f?.return_departure?.slice(0, 10),
     nights: f?.nightsInDest,
     airlines: f?.airlines,
+    airlineCode: f?.airlineCode,
     source: f?.source,
   }));
 

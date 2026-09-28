@@ -666,11 +666,41 @@ export async function searchSerpapiRoundTripHard(
             const retDepDate = retDepStr ? new Date(retDepStr) : (() => { const d = new Date(c.rtrn); d.setHours(10,0,0,0); return d; })();
             const actualNights = Number.isFinite(depDate.getTime()) && Number.isFinite(retDepDate.getTime())
               ? Math.max(1, Math.round((retDepDate.getTime() - depDate.getTime()) / 86400000)) : c.nights;
-            const airlines = (flightsArr && flightsArr.length > 0)
-              ? segmentCollectAirline(flightsArr)
-              : (airlineCodes && airlineCodes.length > 0 ? airlineCodes.slice() : ["ALL"]);
+            // 🚨 真实航司解析：从 outSegs/inSegs（实际拿到的航段）里拿 airline_code！优先！
+            // 之前用 flightsArr 但如果item.flights结构复杂或者没解析到flightsArr，就返回ALL导致用户不知道是哪家航司！
+            const collectFromSegs = (segs: any[]): string[] => {
+              const s = new Set<string>();
+              if (!segs) return [];
+              for (const seg of segs) {
+                if (!seg) continue;
+                if (seg.airline_code) s.add(String(seg.airline_code));
+                if (seg.airline && typeof seg.airline === "object" && seg.airline.code) s.add(String(seg.airline.code));
+                if (seg.marketing_airline_code) s.add(String(seg.marketing_airline_code));
+                if (seg.marketing_flight_number && seg.marketing_flight_number.slice) {
+                  const prefix = seg.marketing_flight_number.slice(0, 2).toUpperCase();
+                  if (/^[A-Z]{2}$/.test(prefix)) s.add(prefix);
+                }
+                if (seg.flight_number && seg.flight_number.slice) {
+                  const prefix = seg.flight_number.slice(0, 2).toUpperCase();
+                  if (/^[A-Z]{2}$/.test(prefix)) s.add(prefix);
+                }
+              }
+              return Array.from(s);
+            };
+            const fromSegs = collectFromSegs(outSegs).concat(collectFromSegs(inSegs));
+            const fromFlightsArr = (flightsArr && flightsArr.length > 0) ? segmentCollectAirline(flightsArr) : [];
+            const fromItemRaw = Array.isArray(item.airlines) ? item.airlines.map((a: any) => typeof a === "string" ? a : (a?.code || a?.name || "")).filter(Boolean) : [];
+            const airlines = [];
+            const seenA = new Set<string>();
+            for (const a of fromSegs) { const k = String(a).toUpperCase(); if (!seenA.has(k)) { seenA.add(k); airlines.push(String(a)); } }
+            for (const a of fromFlightsArr) { const k = String(a).toUpperCase(); if (!seenA.has(k)) { seenA.add(k); airlines.push(String(a)); } }
+            for (const a of fromItemRaw) { const k = String(a).toUpperCase(); if (!seenA.has(k) && k && k !== "UNDEFINED") { seenA.add(k); airlines.push(String(a)); } }
+            if (airlines.length === 0) {
+              if (airlineCodes && airlineCodes.length > 0) airlines.push(...airlineCodes.slice());
+              else airlines.push("ALL");
+            }
             if (filterAirlines && airlineCodes && airlineCodes.length > 0) {
-              const inList = airlines.some((a: string) => airlineCodes.includes(a));
+              const inList = airlines.some((a: string) => airlineCodes.includes(String(a).toUpperCase()));
               if (!inList) continue;
             }
             const airlinesKey = airlines.length > 0 ? airlines.join(",") : "all";
