@@ -195,8 +195,11 @@ async function collectSerp(
     const fromAirports = expandCityToAirports(searchCfg.flyFrom || "TYO");
     const toAirports = expandCityToAirports(searchCfg.flyTo || "DLC");
     const mode = searchCfg.mode || "full";
-    const maxCalls = mode === "light" ? 12 : 24;
-    const r = await searchSerpapiRoundTripHard(
+    const maxCalls = mode === "light" ? 10 : 18;
+
+    // ✅ 策略：先**不带航司筛选**搜一遍，保证至少有数据！
+    // 如果用户配置了selectAirlines，就：先本地过滤要的 → 如果不够3条 → 把全航司的也带上（保证不空）
+    const allAirlinesResults = await searchSerpapiRoundTripHard(
       {
         api_key: cfg.serpApiKey,
         fromAirports,
@@ -205,21 +208,49 @@ async function collectSerp(
         minNights: searchCfg.minNights || 3,
         maxNights: searchCfg.maxNights || 14,
         maxCalls,
-        stopWhenFoundN: 15,
+        stopWhenFoundN: 20,
         stopWhenPriceBelow: searchCfg.maxPriceJPY || undefined,
-        singleCallTimeoutMs: mode === "light" ? 3500 : 5500,
-        airlineCodes:
-          searchCfg.selectAirlines && searchCfg.selectAirlines.length > 0
-            ? searchCfg.selectAirlines
-            : undefined,
-        maxPrice: searchCfg.maxPriceJPY || undefined,
+        singleCallTimeoutMs: mode === "light" ? 3000 : 4500,
         adults: searchCfg.adults || 1,
         currency: "JPY",
         hl: "ja",
-        filterAirlines: !!(searchCfg.selectAirlines && searchCfg.selectAirlines.length > 0),
+        filterAirlines: false, // ❗️永远不在这里硬过滤！先全量拿回来
+        maxPrice: searchCfg.maxPriceJPY || undefined,
       }
     );
-    for (const f of r) flights.push(unifySerp(f as any));
+    const allUnified = allAirlinesResults.map(f => unifySerp(f as any));
+    const wantsAirlines =
+      searchCfg.selectAirlines && searchCfg.selectAirlines.length > 0
+        ? searchCfg.selectAirlines.map(s => String(s).toUpperCase())
+        : null;
+
+    if (!wantsAirlines) {
+      for (const f of allUnified) flights.push(f);
+    } else {
+      // 先过滤符合selectAirlines的
+      const filtered = allUnified.filter(f => {
+        if (!f.airlines || f.airlines.length === 0) return true;
+        return f.airlines.some(a => wantsAirlines.includes(String(a).toUpperCase()));
+      });
+      // 如果过滤后>=3条 → 只带过滤的
+      if (filtered.length >= 3) {
+        for (const f of filtered) flights.push(f);
+      } else {
+        // <3条 → 过滤的放前面，然后全量的补齐到15条
+        const seen = new Set<string>();
+        for (const f of filtered) {
+          seen.add(f.id || `${f.flyFrom}-${f.flyTo}-${f.local_departure}-${f.priceJPY}`);
+          flights.push(f);
+        }
+        for (const f of allUnified) {
+          if (flights.length >= 15) break;
+          const key = f.id || `${f.flyFrom}-${f.flyTo}-${f.local_departure}-${f.priceJPY}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          flights.push(f);
+        }
+      }
+    }
   } catch (e) {
     errors.push(`SerpAPI: ${e instanceof Error ? e.message : String(e)}`);
   }
