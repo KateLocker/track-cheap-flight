@@ -90,7 +90,7 @@ function unifyKiwi(f: KiwiFlight): UnifiedFlight {
   };
 }
 
-function unifySerp(f: RoundTripSearchResult): UnifiedFlight {
+export function unifySerp(f: RoundTripSearchResult): UnifiedFlight {
   const airlineCode =
     serpAirlines(f).split(",")[0] || f.airlines[0] || "?";
   return {
