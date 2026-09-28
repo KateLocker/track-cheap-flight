@@ -195,7 +195,7 @@ async function collectSerp(
     const fromAirports = expandCityToAirports(searchCfg.flyFrom || "TYO");
     const toAirports = expandCityToAirports(searchCfg.flyTo || "DLC");
     const mode = searchCfg.mode || "full";
-    const maxCalls = mode === "light" ? 10 : 18;
+    const maxCalls = mode === "light" ? 5 : 8; // Vercel Hobby 10秒极限内！每个call 3秒，够15条就停！实际第一个call就有8条！
 
     // ✅ 策略：先**不带航司筛选**搜一遍，保证至少有数据！
     // 如果用户配置了selectAirlines，就：先本地过滤要的 → 如果不够3条 → 把全航司的也带上（保证不空）
@@ -210,7 +210,7 @@ async function collectSerp(
         maxCalls,
         stopWhenFoundN: 20,
         stopWhenPriceBelow: searchCfg.maxPriceJPY || undefined,
-        singleCallTimeoutMs: mode === "light" ? 3000 : 4500,
+        singleCallTimeoutMs: mode === "light" ? 2500 : 3000, // 每个call 3秒内
         adults: searchCfg.adults || 1,
         currency: "JPY",
         hl: "ja",
