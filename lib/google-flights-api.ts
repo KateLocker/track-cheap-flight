@@ -709,6 +709,7 @@ export async function searchSerpapiRoundTripHard(
             seenKeys.add(key);
             const flatRoute: GFlightsSegment[] = [];
             for (const s of outSegs) flatRoute.push(s as any);
+            const outSegs0Dump = outSegs && outSegs.length > 0 ? Object.keys(outSegs[0] || {}) : [];
             for (const s of inSegs) flatRoute.push(s as any);
             pool.push({
               id: key,
@@ -728,6 +729,13 @@ export async function searchSerpapiRoundTripHard(
               booking_token: item.booking_token || "",
               flights: flightsArr || [[], []],
               route: flatRoute,
+              raw: {
+                itemTopKeys: Object.keys(item || {}),
+                flightsArrLen: flightsArr ? flightsArr.length : 0,
+                outSegsKeys: outSegs0Dump.slice(0, 50),
+                outSeg0: outSegs && outSegs.length > 0 ? outSegs[0] : null,
+                inSeg0: inSegs && inSegs.length > 0 ? inSegs[0] : null,
+              },
             });
           }
         };
