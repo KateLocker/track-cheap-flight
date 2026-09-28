@@ -7,11 +7,13 @@ import {
   getReturnLegDeparture as kiwiReturnDep,
 } from "./kiwi-api";
 import {
-  searchRoundTripFlexible as serpSearch,
+  searchRoundTripFlexible as serpSearchOld,
   RoundTripSearchResult,
   getAirlineCodesFromFlight as serpAirlines,
   getFirstLegDeparture as serpFirstDep,
   getReturnLegDeparture as serpReturnDep,
+  searchSerpapiRoundTripHard,
+  expandCityToAirports,
 } from "./google-flights-api";
 import {
   searchRoundTripFlexible as amadeusSearch,
@@ -189,8 +191,35 @@ async function collectSerp(
 ) {
   if (!cfg.serpApiKey) return;
   try {
-    const r = await serpSearch(cfg.serpApiKey, cfg.search);
-    for (const f of r) flights.push(unifySerp(f));
+    const searchCfg = cfg.search;
+    const fromAirports = expandCityToAirports(searchCfg.flyFrom || "TYO");
+    const toAirports = expandCityToAirports(searchCfg.flyTo || "DLC");
+    const mode = searchCfg.mode || "full";
+    const maxCalls = mode === "light" ? 12 : 24;
+    const r = await searchSerpapiRoundTripHard(
+      {
+        api_key: cfg.serpApiKey,
+        fromAirports,
+        toAirports,
+        searchDaysAhead: searchCfg.searchDaysAhead || 90,
+        minNights: searchCfg.minNights || 3,
+        maxNights: searchCfg.maxNights || 14,
+        maxCalls,
+        stopWhenFoundN: 15,
+        stopWhenPriceBelow: searchCfg.maxPriceJPY || undefined,
+        singleCallTimeoutMs: mode === "light" ? 3500 : 5500,
+        airlineCodes:
+          searchCfg.selectAirlines && searchCfg.selectAirlines.length > 0
+            ? searchCfg.selectAirlines
+            : undefined,
+        maxPrice: searchCfg.maxPriceJPY || undefined,
+        adults: searchCfg.adults || 1,
+        currency: "JPY",
+        hl: "ja",
+        filterAirlines: !!(searchCfg.selectAirlines && searchCfg.selectAirlines.length > 0),
+      }
+    );
+    for (const f of r) flights.push(unifySerp(f as any));
   } catch (e) {
     errors.push(`SerpAPI: ${e instanceof Error ? e.message : String(e)}`);
   }

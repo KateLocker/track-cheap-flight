@@ -40,6 +40,34 @@ export interface SerpSearchParams {
 
 const SERPAPI_BASE = "https://serpapi.com";
 
+export function expandCityToAirports(code: string): string[] {
+  if (!code) return ["TYO", "NRT", "HND"];
+  const upper = code.toUpperCase().trim();
+  const cityExpansions: Record<string, string[]> = {
+    TYO: ["NRT", "HND", "TYO"],
+    SFO: ["SFO", "OAK", "SJC"],
+    NYC: ["JFK", "LGA", "EWR"],
+    LAX: ["LAX", "LGB", "BUR"],
+    CHI: ["ORD", "MDW"],
+    WAS: ["IAD", "DCA"],
+    PAR: ["CDG", "ORY"],
+    LON: ["LHR", "LGW", "STN"],
+    SEL: ["ICN", "GMP"],
+    SHA: ["PVG", "SHA"],
+    SPK: ["CTS", "SPK"],
+    OSA: ["KIX", "ITM"],
+    BJS: ["PEK", "PKX"],
+    TYO_NRT: ["NRT", "HND"],
+  };
+  const out: string[] = [];
+  for (const c of (cityExpansions[upper] || [])) {
+    if (!out.includes(c)) out.push(c);
+  }
+  if (!out.includes(upper)) out.push(upper);
+  // DLC是小机场，不用扩展，DLC本身就是实际机场
+  return out;
+}
+
 function dateRangeToStr(start: Date, end: Date): string {
   const s = format(start, "yyyy-MM-dd");
   const e = format(end, "yyyy-MM-dd");
@@ -439,4 +467,308 @@ export function getReturnLegDeparture(f: RoundTripSearchResult): string {
 
 export function getSearchBudgetHint() {
   return { searchBudget: 250 };
+}
+
+// 终极杀招！直接原生SerpAPI type=1 round_trip 逐个日期×泊数×机场调用
+// 参考debug-provider hard test实现，已实锤最低¥55,834 NRT→DLC往返真实存在！
+// 不依赖searchRoundTripFlexible复杂封装逻辑，直接硬调用！
+export async function searchSerpapiRoundTripHard(
+  params: {
+    api_key: string;
+    fromAirports: string[];
+    toAirports: string[];
+    searchDaysAhead: number;
+    minNights: number;
+    maxNights: number;
+    maxCalls?: number;
+    stopWhenFoundN?: number;
+    stopWhenPriceBelow?: number;
+    singleCallTimeoutMs?: number;
+    airlineCodes?: string[];
+    maxPrice?: number;
+    adults?: number;
+    currency?: string;
+    hl?: string;
+    filterAirlines?: boolean;
+    silent?: boolean;
+  },
+  onProgress?: (msg: string) => void
+): Promise<GFlightsOption[]> {
+  const {
+    api_key,
+    fromAirports,
+    toAirports,
+    searchDaysAhead,
+    minNights,
+    maxNights,
+    maxCalls = 24,
+    stopWhenFoundN = 15,
+    stopWhenPriceBelow,
+    singleCallTimeoutMs = 7000,
+    airlineCodes,
+    maxPrice,
+    adults = 1,
+    currency = "JPY",
+    hl = "ja",
+    filterAirlines = true,
+    silent = false,
+  } = params;
+  const seenKeys = new Set<string>();
+  const pool: GFlightsOption[] = [];
+
+  // 1. 生成 6~8个关键出发日
+  const departCandidates: Date[] = [];
+  const firstDepart = new Date();
+  firstDepart.setDate(firstDepart.getDate() + 7);
+  const lastDepart = new Date();
+  lastDepart.setDate(lastDepart.getDate() + Math.max(14, Math.min(searchDaysAhead, 120)));
+  const totalDays = Math.max(7, Math.round((lastDepart.getTime() - firstDepart.getTime()) / 86400000));
+  const numDepartPoints = Math.min(8, Math.max(4, Math.ceil(totalDays / 14)));
+  const departStep = Math.max(7, Math.ceil(totalDays / numDepartPoints));
+  for (let i = 0; i < numDepartPoints; i++) {
+    departCandidates.push(addDays(firstDepart, i * departStep));
+  }
+
+  // 2. 泊数：min / 中间 / max
+  const nightCandidates: number[] = [];
+  nightCandidates.push(minNights);
+  const mid = Math.round((minNights + maxNights) / 2);
+  if (mid !== minNights && mid !== maxNights) nightCandidates.push(mid);
+  if (maxNights !== minNights && maxNights !== mid) nightCandidates.push(maxNights);
+  if (nightCandidates.length < 3) {
+    if (!nightCandidates.includes(7) && 7 >= minNights && 7 <= maxNights) nightCandidates.push(7);
+    if (!nightCandidates.includes(10) && 10 >= minNights && 10 <= maxNights) nightCandidates.push(10);
+  }
+  nightCandidates.length = Math.min(3, nightCandidates.length);
+
+  // 3. 生成组合：from × depart × nights × to
+  type Comb = { f: string; t: string; depart: Date; nights: number; rtrn: Date };
+  const combos: Comb[] = [];
+  for (const f of fromAirports) {
+    for (const t of toAirports) {
+      for (const d of departCandidates) {
+        for (const n of nightCandidates) {
+          combos.push({ f, t, depart: d, nights: n, rtrn: addDays(d, n) });
+        }
+      }
+    }
+  }
+  combos.sort((a, b) => a.depart.getTime() - b.depart.getTime());
+  const finalCombos = combos.slice(0, Math.min(maxCalls, combos.length));
+
+  const isoDate = (s: string) => new Date(s).toISOString();
+  const segmentCollectAirline = (fl: any): string[] => {
+    const s = new Set<string>();
+    const arrs = Array.isArray(fl) ? fl : [fl];
+    for (const arr of arrs) {
+      if (Array.isArray(arr)) {
+        for (const seg of arr) {
+          if (seg?.airline_code) s.add(String(seg.airline_code));
+        }
+      }
+    }
+    return Array.from(s);
+  };
+
+  onProgress?.(`Serpapi round trip hard search: ${finalCombos.length} calls (from=${fromAirports.join(",")} nights=${nightCandidates.join(",")})`);
+
+  let callCount = 0;
+  for (const c of finalCombos) {
+    if (pool.length >= stopWhenFoundN) break;
+    if (stopWhenPriceBelow) {
+      const curMin = pool.reduce((m, x) => Math.min(m, x.price), Infinity);
+      if (curMin <= stopWhenPriceBelow) break;
+    }
+    callCount++;
+    const queryParams: Record<string, unknown> = {
+      engine: "google_flights",
+      api_key,
+      departure_id: c.f,
+      arrival_id: c.t,
+      outbound_date: format(c.depart, "yyyy-MM-dd"),
+      return_date: format(c.rtrn, "yyyy-MM-dd"),
+      currency,
+      hl,
+      adults,
+      type: "1",
+    };
+    if (airlineCodes && airlineCodes.length > 0) queryParams.airline_codes = airlineCodes.join(",");
+    if (typeof maxPrice === "number" && maxPrice > 0) queryParams.max_price = maxPrice;
+
+    const startTs = Date.now();
+    try {
+      const resp = await axios.get("https://serpapi.com/search", {
+        params: queryParams,
+        timeout: singleCallTimeoutMs,
+      });
+      const data: any = resp.data;
+      if (data?.error) {
+        onProgress?.(`Call ${callCount}/${finalCombos.length} ${c.f}→${c.t} d=${format(c.depart,"MM-dd")} n=${c.nights}: err ${String(data.error).slice(0, 80)}`);
+      } else {
+        const pushList = (list: unknown) => {
+          if (!Array.isArray(list)) return;
+          for (const raw of list) {
+            const item: any = raw;
+            if (!item || typeof item.price !== "number" || item.price <= 0) continue;
+            if (typeof maxPrice === "number" && maxPrice > 0 && item.price > maxPrice) continue;
+
+            let flightsArr: any = Array.isArray(item.flights) ? item.flights : null;
+            let outSegs: any[] = [];
+            let inSegs: any[] = [];
+            if (flightsArr && flightsArr.length > 0) {
+              if (Array.isArray(flightsArr[0])) outSegs = flightsArr[0];
+              else if (flightsArr[0] && Array.isArray(flightsArr[0].segments)) outSegs = flightsArr[0].segments;
+              if (flightsArr.length > 1) {
+                if (Array.isArray(flightsArr[1])) inSegs = flightsArr[1];
+                else if (flightsArr[1] && Array.isArray(flightsArr[1].segments)) inSegs = flightsArr[1].segments;
+              }
+            }
+            if ((!outSegs || outSegs.length === 0) && Array.isArray(item.flights)) {
+              for (const top of item.flights as any[]) {
+                const segs = top?.segments || top;
+                if (Array.isArray(segs) && segs.length > 0 && segs[0]?.departure_airport) {
+                  if (outSegs.length === 0) outSegs = segs;
+                  else if (inSegs.length === 0) inSegs = segs;
+                }
+              }
+            }
+            const firstOut = outSegs[0];
+            const lastOut = outSegs.slice(-1)[0];
+            const firstIn = inSegs[0];
+            const lastIn = inSegs.slice(-1)[0];
+            const depStr = firstOut?.departure_airport?.time || firstOut?.departure_airport?.departure_time || "";
+            const arrStr = lastOut?.arrival_airport?.time || lastOut?.arrival_airport?.arrival_time || depStr;
+            const retDepStr = firstIn?.departure_airport?.time || firstIn?.departure_airport?.departure_time || "";
+            const retArrStr = lastIn?.arrival_airport?.time || lastIn?.arrival_airport?.arrival_time || retDepStr;
+
+            const depDate = depStr ? new Date(depStr) : (() => { const d = new Date(c.depart); d.setHours(10,0,0,0); return d; })();
+            const retDepDate = retDepStr ? new Date(retDepStr) : (() => { const d = new Date(c.rtrn); d.setHours(10,0,0,0); return d; })();
+            const actualNights = Number.isFinite(depDate.getTime()) && Number.isFinite(retDepDate.getTime())
+              ? Math.max(1, Math.round((retDepDate.getTime() - depDate.getTime()) / 86400000)) : c.nights;
+            const airlines = (flightsArr && flightsArr.length > 0)
+              ? segmentCollectAirline(flightsArr)
+              : (airlineCodes && airlineCodes.length > 0 ? airlineCodes.slice() : ["ALL"]);
+            if (filterAirlines && airlineCodes && airlineCodes.length > 0) {
+              const inList = airlines.some((a: string) => airlineCodes.includes(a));
+              if (!inList) continue;
+            }
+            const airlinesKey = airlines.length > 0 ? airlines.join(",") : "all";
+            const key = `${c.f}-${c.t}-${format(depDate, "yyyyMMdd")}-${actualNights}n-${airlinesKey}-${Math.floor(item.price / 100)}`;
+            if (seenKeys.has(key)) continue;
+            seenKeys.add(key);
+            const flatRoute: GFlightsSegment[] = [];
+            for (const s of outSegs) flatRoute.push(s as any);
+            for (const s of inSegs) flatRoute.push(s as any);
+            pool.push({
+              id: key,
+              price: item.price,
+              currency,
+              flyFrom: c.f,
+              flyTo: c.t,
+              cityFrom: c.f,
+              cityTo: c.t,
+              local_departure: Number.isFinite(depDate.getTime()) ? depDate.toISOString() : c.depart.toISOString(),
+              local_arrival: arrStr ? isoDate(arrStr) : new Date(depDate.getTime() + 3 * 3600 * 1000).toISOString(),
+              return_departure: Number.isFinite(retDepDate.getTime()) ? retDepDate.toISOString() : c.rtrn.toISOString(),
+              return_arrival: retArrStr ? isoDate(retArrStr) : new Date(retDepDate.getTime() + 3 * 3600 * 1000).toISOString(),
+              airlines: airlines.length > 0 ? airlines : ["ALL"],
+              nightsInDest: actualNights,
+              deep_link: item.deep_link || `https://www.google.com/travel/flights?q=${c.f}${c.t}${format(c.depart,"yyyyMMdd")}${format(c.rtrn,"yyyyMMdd")}`,
+              booking_token: item.booking_token || "",
+              flights: flightsArr || [[], []],
+              route: flatRoute,
+            });
+          }
+        };
+        pushList(data.best_flights);
+        pushList(data.other_flights);
+        if (data.flights) pushList(Array.isArray(data.flights) ? data.flights : [data.flights]);
+        if (data?.trip_results?.flights) pushList(data.trip_results.flights);
+      }
+      const got = pool.length;
+      const elapsed = Date.now() - startTs;
+      const low = pool.length > 0 ? pool.reduce((m, x) => Math.min(m, x.price), Infinity) : Infinity;
+      onProgress?.(`Call ${callCount}/${finalCombos.length} ${c.f}→${c.t} d=${format(c.depart,"MM-dd")} n=${c.nights}: got=${got} elapsed=${elapsed}ms curLow=${low === Infinity ? "-" : "¥" + Math.round(low)}`);
+    } catch (e: any) {
+      const elapsed = Date.now() - startTs;
+      const msg = e?.response?.data?.error || e?.message || String(e);
+      if (!silent) onProgress?.(`Call ${callCount}/${finalCombos.length} ${c.f}→${c.t} d=${format(c.depart,"MM-dd")} n=${c.nights}: err ${elapsed}ms ${String(msg).slice(0, 90)}`);
+      if (airlineCodes && airlineCodes.length > 0 && (/no results|hasn't returned|timeout/i.test(String(msg)) || elapsed >= singleCallTimeoutMs - 500)) {
+        onProgress?.(`  ↳ retry without airline filter`);
+        try {
+          const retryParams: any = { ...queryParams };
+          delete retryParams.airline_codes;
+          const resp2 = await axios.get("https://serpapi.com/search", {
+            params: retryParams,
+            timeout: Math.max(3500, singleCallTimeoutMs - 2500),
+          });
+          const data2: any = resp2.data;
+          const pushList2 = (list: unknown) => {
+            if (!Array.isArray(list)) return;
+            for (const raw of list) {
+              const item: any = raw;
+              if (!item || typeof item.price !== "number" || item.price <= 0) continue;
+              if (typeof maxPrice === "number" && maxPrice > 0 && item.price > maxPrice) continue;
+              const flightsArr: any = Array.isArray(item.flights) ? item.flights : null;
+              let outSegs: any[] = [];
+              let inSegs: any[] = [];
+              if (flightsArr && flightsArr.length > 0) {
+                if (Array.isArray(flightsArr[0])) outSegs = flightsArr[0];
+                if (flightsArr.length > 1 && Array.isArray(flightsArr[1])) inSegs = flightsArr[1];
+              }
+              const firstOut = outSegs[0];
+              const firstIn = inSegs[0];
+              const depStr = firstOut?.departure_airport?.time || "";
+              const retDepStr = firstIn?.departure_airport?.time || "";
+              const depDate = depStr ? new Date(depStr) : (() => { const d = new Date(c.depart); d.setHours(10,0,0,0); return d; })();
+              const retDepDate = retDepStr ? new Date(retDepStr) : (() => { const d = new Date(c.rtrn); d.setHours(10,0,0,0); return d; })();
+              const actualNights = Number.isFinite(depDate.getTime()) && Number.isFinite(retDepDate.getTime())
+                ? Math.max(1, Math.round((retDepDate.getTime() - depDate.getTime()) / 86400000)) : c.nights;
+              const airlines = (flightsArr && flightsArr.length > 0)
+                ? segmentCollectAirline(flightsArr)
+                : ["ALL"];
+              if (filterAirlines) {
+                const inList = airlines.some((a: string) => airlineCodes.includes(a));
+                if (!inList) continue;
+              }
+              const airlinesKey = airlines.join(",");
+              const key = `${c.f}-${c.t}-${format(depDate, "yyyyMMdd")}-${actualNights}n-${airlinesKey}-${Math.floor(item.price / 100)}-r`;
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
+              const flatRoute: GFlightsSegment[] = [];
+              for (const s of outSegs) flatRoute.push(s as any);
+              for (const s of inSegs) flatRoute.push(s as any);
+              pool.push({
+                id: key,
+                price: item.price,
+                currency,
+                flyFrom: c.f,
+                flyTo: c.t,
+                cityFrom: c.f,
+                cityTo: c.t,
+                local_departure: depDate.toISOString(),
+                local_arrival: new Date(depDate.getTime() + 3 * 3600 * 1000).toISOString(),
+                return_departure: retDepDate.toISOString(),
+                return_arrival: new Date(retDepDate.getTime() + 3 * 3600 * 1000).toISOString(),
+                airlines: airlines.length > 0 ? airlines : ["ALL"],
+                nightsInDest: actualNights,
+                deep_link: item.deep_link || `https://www.google.com/travel/flights?q=${c.f}${c.t}${format(c.depart,"yyyyMMdd")}${format(c.rtrn,"yyyyMMdd")}`,
+                booking_token: item.booking_token || "",
+                flights: flightsArr || [[], []],
+                route: flatRoute,
+              });
+            }
+          };
+          pushList2(data2.best_flights);
+          pushList2(data2.other_flights);
+          if (data2.flights) pushList2(Array.isArray(data2.flights) ? data2.flights : [data2.flights]);
+        } catch (_e2) {
+          /* ignore */
+        }
+      }
+    }
+  }
+  pool.sort((a, b) => a.price - b.price);
+  onProgress?.(`Serpapi hard search done: got ${pool.length} lowest=${pool.length > 0 ? "¥" + pool[0].price : "-"} (calls=${callCount}/${finalCombos.length})`);
+  return pool;
 }
