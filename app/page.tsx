@@ -161,6 +161,9 @@ function fmtDateTime(iso?: string | null): string {
 
 function fmtDate(iso?: string | null): string {
   if (!iso) return "-";
+  // Flight dates are origin-local calendar dates, not viewer-local instants.
+  const calendarDate = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (calendarDate) return `${calendarDate[1]}/${calendarDate[2]}/${calendarDate[3]}`;
   try {
     const d = new Date(iso);
     const pad = (n: number) => n.toString().padStart(2, "0");

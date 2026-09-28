@@ -46,6 +46,7 @@ const AIRLINE_NAMES: Record<string, string> = {
   MF: "厦門航空",
   OZ: "アシアナ航空 (韩亚航空)",
   KE: "大韓航空",
+  FM: "上海航空",
 };
 
 export function getAirlineName(code: string): string {
