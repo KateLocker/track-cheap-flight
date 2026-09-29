@@ -1,6 +1,7 @@
 import axios from "axios";
 import { format, addDays } from "date-fns";
 import type { SearchConfig } from "./config";
+import { SearchBudget } from "./search-budget";
 
 export interface KiwiFlight {
   id: string;
@@ -20,11 +21,14 @@ export interface KiwiFlight {
     local_departure: string;
     local_arrival: string;
     flight_no: number;
+    return?: number;
   }>;
   deep_link: string;
   booking_token: string;
   nightsInDest: number;
   return?: number;
+  technical_stops?: number;
+  isNonStop?: boolean;
 }
 
 export interface KiwiSearchParams {
@@ -56,10 +60,11 @@ function buildHeaders(apiKey: string) {
 
 export async function searchRoundTripFlexible(
   apiKey: string,
-  config: SearchConfig
+  config: SearchConfig,
+  budget = new SearchBudget(1)
 ): Promise<KiwiFlight[]> {
-  const today = new Date();
-  const maxDate = addDays(today, config.searchDaysAhead);
+  const today = addDays(new Date(), 1);
+  const maxDate = addDays(new Date(), config.searchDaysAhead);
   const dateFrom = format(today, "dd/MM/yyyy");
   const dateTo = format(maxDate, "dd/MM/yyyy");
 
@@ -69,7 +74,7 @@ export async function searchRoundTripFlexible(
     date_from: dateFrom,
     date_to: dateTo,
     return_from: dateFrom,
-    return_to: dateTo,
+    return_to: format(addDays(maxDate, config.maxNights), "dd/MM/yyyy"),
     nights_in_dst_from: config.minNights,
     nights_in_dst_to: config.maxNights,
     adults: config.adults,
@@ -82,9 +87,11 @@ export async function searchRoundTripFlexible(
     locale: "ja",
     sort: "price",
     asc: 1,
-    limit: 1000,
+    limit: 50,
     vehicle_type: "aircraft",
   };
+
+  if (config.nonStopOnly) params.max_stopovers = 0;
 
   if (config.selectAirlines && config.selectAirlines.length > 0) {
     params["select_airlines"] = config.selectAirlines.join(",");
@@ -95,13 +102,14 @@ export async function searchRoundTripFlexible(
   }
 
   try {
-    const resp = await axios.get(`${TEQUILA_BASE}/v2/search`, {
+    const resp = await budget.request(options => axios.get(`${TEQUILA_BASE}/v2/search`, {
+      ...options,
       headers: buildHeaders(apiKey),
       params,
-      timeout: 60_000,
-    });
+    }));
     const data = resp.data as { data?: KiwiFlight[] };
-    return data.data ?? [];
+    return (data.data ?? []).map(f => ({ ...f, isNonStop: isKiwiNonStop(f) }))
+      .filter(f => !config.nonStopOnly || f.isNonStop);
   } catch (err: unknown) {
     if (axios.isAxiosError(err) && err.response) {
       const status = err.response.status;
@@ -116,7 +124,7 @@ export async function searchRoundTripFlexible(
 
 export function getAirlineCodesFromFlight(f: KiwiFlight): string {
   const set = new Set<string>();
-  for (const r of f.route) set.add(r.airline);
+  for (const r of f.route) set.add(r.airline || "?");
   return Array.from(set).join(",");
 }
 
@@ -126,12 +134,17 @@ export function getFirstLegDeparture(f: KiwiFlight): string {
 }
 
 export function getReturnLegDeparture(f: KiwiFlight): string {
-  if (!f.return || f.route.length < 2) return f.local_arrival;
-  const firstAirline = f.route[0].airline;
-  const returnLegIdx = f.route.findIndex(
-    (r, i) => i > 0 && r.airline === firstAirline
-  );
-  if (returnLegIdx > 0) return f.route[returnLegIdx].local_departure;
-  const half = Math.floor(f.route.length / 2);
-  return f.route[half]?.local_departure ?? f.local_arrival;
+  const returnLeg = f.route.find(r => r.return === 1)
+    ?? f.route.find((r, i) => i > 0 && r.flyFrom === f.flyTo);
+  return returnLeg?.local_departure ?? "";
+}
+
+export function isKiwiNonStop(f: KiwiFlight): boolean {
+  // Kiwi's technical_stops is itinerary-wide. Unknown stop counts or journey direction are not confirmations.
+  if (f.technical_stops !== 0 || !Array.isArray(f.route) || f.route.length !== 2) return false;
+  const [outbound, inbound] = f.route;
+  return outbound.return === 0 && inbound.return === 1
+    && !!outbound.flyFrom && !!outbound.flyTo && !!inbound.flyFrom && !!inbound.flyTo
+    && outbound.flyFrom === f.flyFrom && outbound.flyTo === f.flyTo && inbound.flyFrom === f.flyTo && inbound.flyTo === f.flyFrom
+    && !!outbound.local_departure && !!outbound.local_arrival && !!inbound.local_departure && !!inbound.local_arrival;
 }

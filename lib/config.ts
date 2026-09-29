@@ -6,6 +6,7 @@ export interface SearchConfig {
   maxNights: number;
   adults: number;
   selectAirlines: string[];
+  nonStopOnly: boolean;
   maxPriceJPY: number | null;
   mode?: "full" | "light";
 }
@@ -38,10 +39,10 @@ export interface AppConfig {
 }
 
 function parseList(val: string | undefined, fallback: string[] = []): string[] {
-  if (!val) return fallback;
+  if (val == null) return fallback;
   return val
     .split(",")
-    .map((s) => s.trim())
+    .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
 }
 
@@ -68,6 +69,7 @@ export function loadConfig(): AppConfig {
       maxNights: parseIntSafe(env.MAX_NIGHTS, 14) ?? 14,
       adults: parseIntSafe(env.ADULTS, 1) ?? 1,
       selectAirlines: parseList(env.SELECT_AIRLINES, ["NH"]),
+      nonStopOnly: env.NONSTOP_ONLY?.trim().toLowerCase() !== "false",
       maxPriceJPY: parseIntSafe(env.MAX_PRICE_JPY, null),
     },
     email: {

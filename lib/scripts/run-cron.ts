@@ -1,6 +1,8 @@
-import "dotenv/config";
+import { loadEnvConfig } from "@next/env";
 import { startCronScheduler } from "../cron-scheduler";
 import { runFullSearch } from "../search-service";
+
+loadEnvConfig(process.cwd());
 
 async function main() {
   console.log("▶ Flight Tracker - Cron Daemon\n");
@@ -23,5 +25,5 @@ async function main() {
 
 main().catch((e) => {
   console.error("Fatal:", e);
-  process.exit(1);
+  process.exitCode = 1;
 });

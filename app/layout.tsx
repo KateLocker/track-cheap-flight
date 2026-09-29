@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "んぽ Flight Tracker - ANA 東京⇔大连 最安値監視",
-  description: "ANAの東京（TYO）→大连（DLC）往復最安値を自動検索 & メール通知",
+  title: "んぽ Flight Tracker - 往復航空券の価格チェック",
+  description: "指定した路線と航空会社の往復航空券を定期検索し、低価格をメールでお知らせします。",
 };
 
 export default function RootLayout({

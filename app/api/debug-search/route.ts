@@ -1,3 +1,4 @@
+import { requireAdmin, limitAdminAction } from "@/lib/auth";
 import { NextResponse } from "next/server";
 import { loadConfig, AppConfig } from "@/lib/config";
 import { expandCityToAirports, searchSerpapiRoundTripHard } from "@/lib/google-flights-api";
@@ -5,7 +6,7 @@ import { unifySerp } from "@/lib/search-service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 10;
+export const maxDuration = 60;
 
 // 递归收集所有含"airline"或"code"或"flight"的key
 function collectAirlineKeys(obj: any, prefix = "", out: Record<string, any> = {}, maxDepth = 4): Record<string, any> {
@@ -47,8 +48,13 @@ function collectAirlineKeys(obj: any, prefix = "", out: Record<string, any> = {}
   return out;
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const unauthorized = requireAdmin(request);
+  if (unauthorized) return unauthorized;
+  const limited = limitAdminAction("diagnostics", 2);
+  if (limited) return limited;
   const cfg = loadConfig();
+  if (!cfg.serpApiKey) return NextResponse.json({ ok: false, error: "SERPAPI_KEY is not configured." }, { status: 503 });
   const startedAt = Date.now();
   const searchCfg = cfg.search;
 
@@ -78,6 +84,7 @@ export async function GET() {
         stopWhenFoundN: 15,
         singleCallTimeoutMs: 3000,
         filterAirlines: false,
+        nonStopOnly: searchCfg.nonStopOnly,
         hl: "ja",
         currency: "JPY",
       },

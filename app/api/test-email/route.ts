@@ -1,68 +1,39 @@
 import { NextResponse } from "next/server";
 import { loadConfig } from "@/lib/config";
-import { sendAlertEmail, buildAlertEmail } from "@/lib/email";
+import { sendAlertEmail } from "@/lib/email";
+import { requireAdmin, limitAdminAction } from "@/lib/auth";
+import { InputError, readJSONObject } from "@/lib/api-validation";
+import type { FlightRecord } from "@/lib/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
-export async function POST(req: Request) {
+export async function POST(request: Request) {
+  const unauthorized = requireAdmin(request);
+  if (unauthorized) return unauthorized;
   try {
-    const body = (await req.json()) as { email?: string };
+    const body = await readJSONObject(request);
+    if (Object.keys(body).length > 0) throw new InputError("Test email uses only the configured recipient; request fields are not accepted.");
     const cfg = loadConfig();
-
-    if (!cfg.email.enabled || !cfg.email.smtpUser) {
-      return NextResponse.json(
-        { success: false, error: "メール設定が無効です" },
-        { status: 400 }
-      );
+    if (!cfg.email.enabled) return NextResponse.json({ success: false, error: "Email notifications are disabled." }, { status: 503 });
+    if (!cfg.email.smtpHost || !cfg.email.smtpUser || !cfg.email.smtpPass || !cfg.email.emailTo) {
+      return NextResponse.json({ success: false, error: "SMTP and recipient configuration must be completed first." }, { status: 503 });
     }
-
-    const to = body.email || cfg.email.emailTo;
-    if (!to) {
-      return NextResponse.json(
-        { success: false, error: "宛先メールアドレスがありません" },
-        { status: 400 }
-      );
-    }
-
-    const testFlight = {
-      id: 0,
-      search_run_id: 0,
-      price: cfg.email.alertPriceJPY,
-      currency: "JPY",
-      fly_from: cfg.search.flyFrom,
-      fly_to: cfg.search.flyTo,
-      airline: "NH",
-      airline_name: "全日空 (ANA) - テストメール",
-      departure_at: new Date(Date.now() + 14 * 86400 * 1000).toISOString(),
-      return_at: new Date(Date.now() + 21 * 86400 * 1000).toISOString(),
-      nights_in_dest: 7,
-      booking_token: "test",
-      deep_link: "https://www.ana.co.jp/",
-      raw_data: "",
+    const limited = limitAdminAction("test-email", 1);
+    if (limited) return limited;
+    const testFlight: FlightRecord = {
+      id: 0, search_run_id: 0, price: cfg.email.alertPriceJPY, currency: "JPY",
+      fly_from: cfg.search.flyFrom, fly_to: cfg.search.flyTo,
+      airline: cfg.search.selectAirlines.join(","), airline_name: "テスト通知（実際の航空券ではありません）",
+      departure_at: new Date(Date.now() + 14 * 86_400_000).toISOString().slice(0, 10),
+      return_at: new Date(Date.now() + 21 * 86_400_000).toISOString().slice(0, 10),
+      nights_in_dest: 7, booking_token: "", deep_link: "", raw_data: "",
       created_at: new Date().toISOString(),
     };
-
-    const content = buildAlertEmail({
-      flight: testFlight,
-      isNewLowest: true,
-      previousLowest: cfg.email.alertPriceJPY + 5000,
-      alertPrice: cfg.email.alertPriceJPY,
-    });
-
-    const { buildTransporter } = await import("@/lib/email");
-    const transporter = buildTransporter(cfg.email);
-    await transporter.sendMail({
-      from: `"Flight Tracker" <${cfg.email.smtpUser}>`,
-      to,
-      subject: `【TEST】${content.subject}`,
-      html: content.html,
-      text: content.text,
-    });
-
-    return NextResponse.json({ success: true, sentTo: to });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return NextResponse.json({ success: false, error: msg }, { status: 500 });
+    await sendAlertEmail(cfg.email, testFlight, false, null, { subjectPrefix: "【TEST】 " });
+    return NextResponse.json({ success: true, sentTo: cfg.email.emailTo }, { headers: { "Cache-Control": "no-store" } });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: error instanceof Error ? error.message : "Test email delivery failed." }, { status: error instanceof InputError ? 400 : 502 });
   }
 }

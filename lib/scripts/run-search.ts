@@ -1,6 +1,8 @@
-import "dotenv/config";
+import { loadEnvConfig } from "@next/env";
 import { runFullSearch } from "../search-service";
 import { formatJPY } from "../email";
+
+loadEnvConfig(process.cwd());
 
 async function main() {
   console.log("▶ Running one-shot flight search...\n");
@@ -28,10 +30,10 @@ async function main() {
     console.log("Link       :", f.deep_link || "-");
   }
 
-  process.exit(res.success ? 0 : 1);
+  process.exitCode = res.success && !res.emailError ? 0 : 1;
 }
 
 main().catch((e) => {
   console.error("Fatal:", e);
-  process.exit(1);
+  process.exitCode = 1;
 });

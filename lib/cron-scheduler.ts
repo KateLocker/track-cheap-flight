@@ -5,35 +5,26 @@ import { runFullSearch } from "./search-service";
 export function startCronScheduler(): void {
   const cfg = loadConfig();
   const { schedule, timezone } = cfg.cron;
-
-  console.log(`[cron] Starting scheduler with schedule="${schedule}" timezone="${timezone}"`);
-  console.log(`[cron] Next search times (first 5):`);
-
-  cron.schedule(
-    schedule,
-    async () => {
-      const startedAt = new Date().toISOString();
-      console.log(`\n[cron] ▶ Triggered search at ${startedAt}`);
-      try {
-        const result = await runFullSearch(cfg);
-        const summary = [
-          `[cron] ✅ Completed`,
-          `Found: ${result.flightsFound} flights`,
-          `Min: ${result.minPrice != null ? `¥${result.minPrice.toLocaleString()}` : "-"}`,
-          `NewLowest: ${result.isNewLowest}`,
-          `Email: ${result.emailSent ? "sent" : "skipped"}${result.emailError ? ` (err: ${result.emailError.slice(0, 80)})` : ""}`,
-          result.error ? `⚠ API warn: ${result.error.slice(0, 120)}` : "",
-        ].filter(Boolean).join(" | ");
-        console.log(summary);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[cron] ❌ Fatal error: ${msg}`);
-      }
-    },
-    {
-      timezone,
-    } as never
-  );
-
-  console.log(`[cron] Scheduler started. Press Ctrl+C to stop.`);
+  if (!cron.validate(schedule)) throw new Error("CRON_SCHEDULE is not a valid cron expression.");
+  new Intl.DateTimeFormat("en", { timeZone: timezone }).format(new Date());
+  let running = false;
+  console.log(`[cron] Starting scheduler: ${schedule} (${timezone})`);
+  const task = cron.schedule(schedule, async () => {
+    if (running) {
+      console.warn("[cron] Previous search is still running in this process; skipping this tick.");
+      return;
+    }
+    running = true;
+    try {
+      const result = await runFullSearch(cfg, "light");
+      console.log(`[cron] ${result.success ? "Completed" : "Failed"}: flights=${result.flightsFound}, min=${result.minPrice ?? "-"}, email=${result.emailSent ? "sent" : "skipped"}`);
+      if (result.error) console.error(`[cron] Search error: ${result.error}`);
+      if (result.emailError) console.error(`[cron] Email error: ${result.emailError}`);
+    } catch (error) {
+      console.error("[cron] Search failed:", error instanceof Error ? error.message : String(error));
+    } finally { running = false; }
+  }, { timezone });
+  const stop = () => { task.stop(); };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }

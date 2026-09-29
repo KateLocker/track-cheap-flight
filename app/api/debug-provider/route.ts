@@ -1,3 +1,4 @@
+import { requireAdmin, limitAdminAction } from "@/lib/auth";
 import { NextResponse } from "next/server";
 import { loadConfig } from "@/lib/config";
 import axios from "axios";
@@ -7,16 +8,20 @@ import { format, addDays } from "date-fns";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
-export async function GET() {
+export async function GET(request: Request) {
+  const unauthorized = requireAdmin(request);
+  if (unauthorized) return unauthorized;
+  const limited = limitAdminAction("diagnostics", 2);
+  if (limited) return limited;
   const cfg = loadConfig();
+  if (!cfg.rapidapiKey && !cfg.serpApiKey) return NextResponse.json({ ok: false, error: "Configure RAPIDAPI_KEY or SERPAPI_KEY first." }, { status: 503 });
   const out: any = {
     ts: new Date().toISOString(),
     has: {
       rapidapiKey: !!cfg.rapidapiKey,
-      rapidapiKeyLen: cfg.rapidapiKey?.length || 0,
       serpApiKey: !!cfg.serpApiKey,
-      serpApiKeyLen: cfg.serpApiKey?.length || 0,
       amadeusClientId: !!cfg.amadeusClientId,
       kiwiApiKey: !!cfg.kiwiApiKey,
     },
@@ -95,6 +100,7 @@ export async function GET() {
         maxNights: 10,
         adults: 1,
         selectAirlines: [],
+        nonStopOnly: cfg.search.nonStopOnly,
         maxPriceJPY: null,
         mode: "full" as const,
       };

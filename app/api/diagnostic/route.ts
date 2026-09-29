@@ -1,8 +1,11 @@
+import { requireAdmin, limitAdminAction } from "@/lib/auth";
+import { airportCode } from "@/lib/api-validation";
 import { NextResponse } from "next/server";
 import axios from "axios";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 const SERP_API = "https://serpapi.com/search.json";
 
@@ -37,14 +40,26 @@ function expandCity(code: string): string[] {
 }
 
 export async function GET(req: Request) {
+  const unauthorized = requireAdmin(req);
+  if (unauthorized) return unauthorized;
   const url = new URL(req.url);
-  const apiKey = url.searchParams.get("api_key") || process.env.SERPAPI_KEY || "";
-  const flyFrom = (url.searchParams.get("flyFrom") || "TYO").toUpperCase();
-  const flyTo = (url.searchParams.get("flyTo") || "DLC").toUpperCase();
-  const airline = url.searchParams.get("airline") || "";
+  if (url.searchParams.has("api_key")) return NextResponse.json({ ok: false, error: "API keys must be configured on the server, not sent in URLs." }, { status: 400 });
+  const apiKey = process.env.SERPAPI_KEY || "";
+  let flyFrom: string;
+  let flyTo: string;
+  const airline = (url.searchParams.get("airline") || "").toUpperCase();
+  try {
+    flyFrom = airportCode(url.searchParams.get("flyFrom") || "TYO", "flyFrom");
+    flyTo = airportCode(url.searchParams.get("flyTo") || "DLC", "flyTo");
+    if (airline && !/^[A-Z0-9]{2}$/.test(airline)) throw new Error("airline must be one two-character airline code.");
+  } catch (error) {
+    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : "Invalid diagnostic parameters." }, { status: 400 });
+  }
+  const limited = limitAdminAction("diagnostics", 2);
+  if (limited) return limited;
 
   if (!apiKey) {
-    return NextResponse.json({ ok: false, error: "SERPAPI_KEY not configured" }, { status: 400 });
+    return NextResponse.json({ ok: false, error: "SERPAPI_KEY not configured" }, { status: 503 });
   }
 
   const froms = expandCity(flyFrom);
@@ -93,7 +108,8 @@ export async function GET(req: Request) {
   let successCount = 0;
   let hitSample: { from: string; to: string; date: string; price: number; airlines?: string[] } | null = null;
 
-  for (let i = 0; i < Math.min(cases.length, 18); i++) {
+  const deadline = Date.now() + 45_000;
+  for (let i = 0; i < Math.min(cases.length, 8) && Date.now() < deadline; i++) {
     const c = cases[i];
     const outboundDate = fmt(c.date);
     const returnDate = fmt(addDays(c.date, 7));
@@ -111,9 +127,9 @@ export async function GET(req: Request) {
         adults: "1",
       };
       if (c.roundTrip) params.return_date = returnDate;
-      if (c.airline) (params as any).airline_codes = c.airline;
+      if (c.airline) params.include_airlines = c.airline;
 
-      const resp = await axios.get(SERP_API, { params, timeout: 60_000 });
+      const resp = await axios.get(SERP_API, { params, timeout: Math.min(8_000, Math.max(1, deadline - Date.now())) });
       const data = resp.data as {
         best_flights?: unknown;
         other_flights?: unknown;
@@ -165,8 +181,9 @@ export async function GET(req: Request) {
     }
   }
 
+  const ok = results.some(result => result.ok);
   return NextResponse.json({
-    ok: true,
+    ok,
     ts: new Date().toISOString(),
     fromExpanded: froms,
     toExpanded: tos,
@@ -174,5 +191,5 @@ export async function GET(req: Request) {
     hits: successCount,
     totalTried: results.length,
     results,
-  });
+  }, { status: ok ? 200 : 502, headers: { "Cache-Control": "no-store" } });
 }

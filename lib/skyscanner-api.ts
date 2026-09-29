@@ -1,6 +1,7 @@
 import axios from "axios";
 import { addDays, format } from "date-fns";
 import type { SearchConfig } from "./config";
+import { SearchBudget, sampleDepartureDates, sampleNights, dateText, matchesAirlines, calendarNights } from "./search-budget";
 
 export interface SkyscannerPlace {
   skyId: string;
@@ -44,6 +45,8 @@ export interface SkyscannerRoundTrip {
   deep_link: string;
   booking_token: string;
   route: unknown[];
+  itineraryComplete?: boolean;
+  isNonStop?: boolean;
 }
 
 export interface PriceCalendarDay {
@@ -67,7 +70,8 @@ function getHeaders(key: string): Record<string, string> {
 
 export async function lookupPlace(
   apiKey: string,
-  query: string
+  query: string,
+  budget = new SearchBudget(1)
 ): Promise<SkyscannerPlace | null> {
   const url = `${BASE}/flights/searchAirport`;
   const q: Record<string, unknown> = {
@@ -75,11 +79,11 @@ export async function lookupPlace(
     locale: MARKET,
   };
   try {
-    const resp = await axios.get(url, {
+    const resp = await budget.request(options => axios.get(url, {
+      ...options,
       params: q,
       headers: getHeaders(apiKey),
-      timeout: 30_000,
-    });
+    }));
     const data = resp.data as {
       status?: boolean;
       data?: Array<{
@@ -120,7 +124,8 @@ export async function getPriceCalendar(
     destinationSkyId: string;
     fromDate: string;
     toDate: string;
-  }
+  },
+  budget = new SearchBudget(1)
 ): Promise<PriceCalendarDay[]> {
   const url = `${BASE}/flights/getPriceCalendar`;
   const q: Record<string, unknown> = {
@@ -133,11 +138,11 @@ export async function getPriceCalendar(
     market: MARKET,
   };
   try {
-    const resp = await axios.get(url, {
+    const resp = await budget.request(options => axios.get(url, {
+      ...options,
       params: q,
       headers: getHeaders(apiKey),
-      timeout: 60_000,
-    });
+    }));
     const data = resp.data as {
       status?: boolean;
       data?: {
@@ -169,7 +174,8 @@ export async function searchSkyscannerOneWay(
     date: string;
     adults?: number;
     cabinClass?: "economy" | "premium_economy" | "business" | "first";
-  }
+  },
+  budget = new SearchBudget(1)
 ): Promise<SkyscannerFlight[]> {
   const url = `${BASE}/flights/searchFlights`;
   const q: Record<string, unknown> = {
@@ -185,11 +191,11 @@ export async function searchSkyscannerOneWay(
     market: MARKET,
   };
   try {
-    const resp = await axios.get(url, {
+    const resp = await budget.request(options => axios.get(url, {
+      ...options,
       params: q,
       headers: getHeaders(apiKey),
-      timeout: 90_000,
-    });
+    }));
     const data = resp.data as {
       status?: boolean;
       data?: {
@@ -212,7 +218,7 @@ export async function searchSkyscannerOneWay(
       };
       context?: { status?: string; totalItineraries?: number };
     };
-    if (!data?.status || !data?.data?.itineraries) return [];
+    if (!data?.status || !data?.data?.itineraries) { budget.warn("供应商未返回有效航班结果。"); return []; }
     return data.data.itineraries.slice(0, 15).map((it: any) => ({
       id: it.id,
       price: it.price?.raw,
@@ -225,6 +231,7 @@ export async function searchSkyscannerOneWay(
         arrival: leg.arrival,
         durationInMinutes: leg.durationInMinutes,
         stopCount: leg.stopCount,
+        segments: leg.segments,
         carriers: (leg.carriers?.marketing || leg.carriers || []).map((c: any) => ({
           name: c.name,
           iata: c.iata,
@@ -248,7 +255,8 @@ export async function searchSkyscannerRoundTripDirect(
     returnDate: string;
     adults?: number;
     cabinClass?: "economy" | "premium_economy" | "business" | "first";
-  }
+  },
+  budget = new SearchBudget(1)
 ): Promise<SkyscannerFlight[]> {
   const url = `${BASE}/flights/searchFlights`;
   const q: Record<string, unknown> = {
@@ -265,13 +273,13 @@ export async function searchSkyscannerRoundTripDirect(
     market: MARKET,
   };
   try {
-    const resp = await axios.get(url, {
+    const resp = await budget.request(options => axios.get(url, {
+      ...options,
       params: q,
       headers: getHeaders(apiKey),
-      timeout: 120_000,
-    });
+    }));
     const data = resp.data as any;
-    if (!data?.status || !data?.data?.itineraries) return [];
+    if (!data?.status || !data?.data?.itineraries) { budget.warn("供应商未返回有效航班结果。"); return []; }
     return (data.data.itineraries as any[]).slice(0, 15).map((it: any) => ({
       id: it.id,
       price: it.price?.raw,
@@ -284,6 +292,7 @@ export async function searchSkyscannerRoundTripDirect(
         arrival: leg.arrival,
         durationInMinutes: leg.durationInMinutes,
         stopCount: leg.stopCount,
+        segments: leg.segments,
         carriers: (leg.carriers?.marketing || leg.carriers || []).map((c: any) => ({
           name: c.name,
           iata: c.iata,
@@ -296,13 +305,13 @@ export async function searchSkyscannerRoundTripDirect(
   }
 }
 
-function legCarrierIatas(leg?: SkyscannerFlight["legs"][number]): string[] {
+function legCarrierIatas(leg?: NonNullable<SkyscannerFlight["legs"]>[number]): string[] {
   if (!leg) return [];
   const out = new Set<string>();
   for (const c of leg.carriers || []) {
-    if (c.iata) out.add(c.iata.toUpperCase());
+    out.add(c.iata ? c.iata.toUpperCase() : "?");
   }
-  return Array.from(out);
+  return out.size ? Array.from(out) : ["?"];
 }
 
 function collectAllAirlines(f: SkyscannerFlight): string[] {
@@ -314,127 +323,66 @@ function collectAllAirlines(f: SkyscannerFlight): string[] {
 }
 
 export async function searchRoundTripFlexible(
-  apiKey: string,
-  cfg: SearchConfig
+  apiKey: string, cfg: SearchConfig,
+  budget = new SearchBudget(cfg.mode === "light" ? 10 : 16)
 ): Promise<SkyscannerRoundTrip[]> {
-  const out: SkyscannerRoundTrip[] = [];
+  const results: SkyscannerRoundTrip[] = [];
+  const fromPlace = await lookupPlace(apiKey, cfg.flyFrom, budget);
+  if (!budget.checkTime()) return results;
+  const toPlace = await lookupPlace(apiKey, cfg.flyTo, budget);
+  if (!fromPlace || !toPlace) {
+    budget.warn("无法确认出发或到达机场。");
+    return results;
+  }
+  const dates = sampleDepartureDates(cfg.searchDaysAhead, budget.remainingRequests);
+  const nights = sampleNights(cfg.minNights, cfg.maxNights);
   const seen = new Set<string>();
-
-  const fromPlace = await lookupPlace(apiKey, cfg.flyFrom);
-  const toPlace = await lookupPlace(apiKey, cfg.flyTo);
-  if (!fromPlace || !toPlace) return [];
-
-  const today = new Date();
-  const startOut = addDays(today, Math.min(14, Math.max(7, Math.floor(cfg.searchDaysAhead / 6))));
-  const endOut = addDays(today, cfg.searchDaysAhead);
-
-  const startStr = format(startOut, "yyyy-MM-dd");
-  const endStr = format(endOut, "yyyy-MM-dd");
-
-  const outboundCal = await getPriceCalendar(apiKey, {
-    originSkyId: fromPlace.skyId,
-    destinationSkyId: toPlace.skyId,
-    fromDate: startStr,
-    toDate: endStr,
-  });
-
-  outboundCal.sort((a, b) => a.price - b.price);
-  const cheapOutbounds = outboundCal.slice(0, 5);
-
-  let dCandidates: { depart: Date; priceEst: number }[] = [];
-  if (cheapOutbounds.length > 0) {
-    for (const d of cheapOutbounds) {
-      const dt = new Date(d.date + "T00:00:00");
-      if (!isNaN(dt.getTime())) dCandidates.push({ depart: dt, priceEst: d.price });
-    }
-  } else {
-    const step = Math.max(5, Math.ceil(cfg.searchDaysAhead / 6));
-    for (let i = 0; i < 6; i++) {
-      const dt = addDays(startOut, step * i);
-      if (dt > endOut) break;
-      dCandidates.push({ depart: dt, priceEst: 0 });
-    }
-  }
-
-  let apiCallsLeft = 5;
-  if (cfg.mode === "light") apiCallsLeft = 3;
-
-  for (const { depart } of dCandidates) {
-    if (apiCallsLeft <= 0) break;
-    const minReturn = addDays(depart, cfg.minNights);
-    const maxReturn = addDays(depart, cfg.maxNights);
-    const tryReturns: Date[] = [];
-    const midNights = Math.floor((cfg.minNights + cfg.maxNights) / 2);
-    tryReturns.push(addDays(depart, cfg.minNights));
-    tryReturns.push(addDays(depart, midNights));
-    tryReturns.push(addDays(depart, cfg.maxNights));
-    for (const ret of tryReturns) {
-      if (ret < minReturn || ret > maxReturn) continue;
-      if (apiCallsLeft <= 0) break;
-      apiCallsLeft--;
-      const d1 = format(depart, "yyyy-MM-dd");
-      const d2 = format(ret, "yyyy-MM-dd");
-      const flights = await searchSkyscannerRoundTripDirect(apiKey, {
-        originSkyId: fromPlace.skyId,
-        destinationSkyId: toPlace.skyId,
-        originEntityId: fromPlace.entityId,
-        destinationEntityId: toPlace.entityId,
-        departDate: d1,
-        returnDate: d2,
-        adults: cfg.adults,
+  for (let i = 0; i < dates.length && budget.checkTime(); i++) {
+    const n = nights[i % nights.length];
+    const d1 = dateText(dates[i]);
+    const d2 = dateText(addDays(dates[i], n));
+    budget.recordDate(d1);
+    const flights = await searchSkyscannerRoundTripDirect(apiKey, {
+      originSkyId: fromPlace.skyId, destinationSkyId: toPlace.skyId,
+      originEntityId: fromPlace.entityId, destinationEntityId: toPlace.entityId,
+      departDate: d1, returnDate: d2, adults: cfg.adults,
+    }, budget);
+    for (const f of flights) {
+      if (!Number.isFinite(f.price) || !f.price || f.price <= 0 || (cfg.maxPriceJPY != null && f.price > cfg.maxPriceJPY)) continue;
+      const outLeg = f.legs?.[0];
+      const inLeg = f.legs?.[1];
+      if (!outLeg) continue;
+      const airlines = collectAllAirlines(f);
+      const complete = !!(outLeg.departure && inLeg?.departure);
+      // This provider's documented response has stopCount; no unverified query parameter is assumed.
+      const isNonStop = complete && f.legs?.length === 2 && f.legs.every(leg => {
+        if (leg.stopCount !== 0) return false;
+        if (leg.segments === undefined) return true;
+        if (!Array.isArray(leg.segments) || leg.segments.length !== 1) return false;
+        const segment = leg.segments[0];
+        if (!segment || typeof segment !== "object") return false;
+        const details = segment as Record<string, unknown>;
+        return [details.stopCount, details.numberOfStops].every(count => count === undefined || count === 0)
+          && (details.stops === undefined || details.stops === 0 || (Array.isArray(details.stops) && details.stops.length === 0));
       });
-      for (const f of flights) {
-        const price = f.price;
-        if (!price || price <= 0) continue;
-        if (cfg.maxPriceJPY != null && price > cfg.maxPriceJPY) continue;
-        const outLeg = f.legs?.[0];
-        const inLeg = f.legs?.[1];
-        if (!outLeg) continue;
-        const allAir = collectAllAirlines(f);
-        if (cfg.selectAirlines && cfg.selectAirlines.length > 0) {
-          const matched = cfg.selectAirlines.some(
-            (c) => allAir.includes(c.toUpperCase())
-          );
-          if (!matched) continue;
-        }
-        const outDep = outLeg.departure || `${d1}T12:00:00`;
-        const outArr = outLeg.arrival || outDep;
-        const retDep = inLeg?.departure || `${d2}T12:00:00`;
-        const retArr = inLeg?.arrival || retDep;
-        const outD = new Date(outDep);
-        const retD = new Date(retDep);
-        const nights = Math.max(
-          0,
-          Math.round((retD.getTime() - outD.getTime()) / (1000 * 60 * 60 * 24))
-        );
-        if (nights < cfg.minNights || nights > cfg.maxNights) continue;
-        const key = `${format(outD, "yyyyMMdd")}|${format(retD, "yyyyMMdd")}|${allAir.join(
-          ","
-        )}|${Math.floor(price / 1000)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push({
-          id: key,
-          price: Math.round(price),
-          currency: "JPY",
-          flyFrom: cfg.flyFrom,
-          flyTo: cfg.flyTo,
-          cityFrom: fromPlace.name || cfg.flyFrom,
-          cityTo: toPlace.name || cfg.flyTo,
-          local_departure: outDep,
-          local_arrival: outArr,
-          return_departure: retDep,
-          return_arrival: retArr,
-          airlines: allAir.length ? allAir : ["?"],
-          nightsInDest: nights,
-          deep_link: f.deep_link || "",
-          booking_token: f.id || key,
-          route: (f.legs || []).slice(0, 8),
-        });
-      }
+      if (cfg.nonStopOnly && !isNonStop) continue;
+      if (cfg.selectAirlines.length && (!complete || !matchesAirlines(airlines, cfg.selectAirlines))) continue;
+      const outDep = outLeg.departure || d1;
+      const retDep = inLeg?.departure || d2;
+      const actualNights = calendarNights(outDep, retDep);
+      if (actualNights < cfg.minNights || actualNights > cfg.maxNights) continue;
+      const key = f.id || JSON.stringify([outDep, retDep, airlines, f.price]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!complete) budget.warn("部分报价的返程时刻未确认。");
+      results.push({
+        id: key, price: f.price, currency: "JPY", flyFrom: cfg.flyFrom, flyTo: cfg.flyTo,
+        cityFrom: fromPlace.name, cityTo: toPlace.name, local_departure: outDep,
+        local_arrival: outLeg.arrival || "", return_departure: retDep, return_arrival: inLeg?.arrival || "",
+        airlines, nightsInDest: actualNights, deep_link: f.deep_link || "", booking_token: f.id || "",
+        route: f.legs || [], itineraryComplete: complete, isNonStop,
+      });
     }
   }
-
-  out.sort((a, b) => a.price - b.price);
-  return out;
+  return results.sort((a, b) => a.price - b.price);
 }

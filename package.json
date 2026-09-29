@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "typecheck": "tsc --noEmit --incremental false",
+    "test": "node --import tsx --test lib/scripts/*.test.ts",
     "search": "tsx lib/scripts/run-search.ts",
     "cron": "tsx lib/scripts/run-cron.ts"
   },

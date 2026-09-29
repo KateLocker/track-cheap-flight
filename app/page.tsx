@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type LowestPrice = {
   id: number;
@@ -46,6 +46,9 @@ type SearchRun = {
 type HistoryPoint = { date: string; min_price: number };
 
 type DashboardData = {
+  error?: string;
+  selectedRoute?: { flyFrom: string; flyTo: string; nonStopOnly: boolean };
+  storage?: { provider: string; configured: boolean };
   config: {
     flyFrom: string;
     flyTo: string;
@@ -53,10 +56,12 @@ type DashboardData = {
     minNights: number;
     maxNights: number;
     selectAirlines: string[];
+    nonStopOnly: boolean;
     emailEnabled: boolean;
     alertPrice: number;
     cronSchedule: string;
     cronTimezone: string;
+    adminConfigured?: boolean;
   };
   latestLowest: LowestPrice | null;
   lowestPrices: LowestPrice[];
@@ -73,7 +78,18 @@ type SearchResult = {
   isNewLowest: boolean;
   previousLowest: number | null;
   emailSent: boolean;
-  provider?: "kiwi" | "serpapi" | "none";
+  emailError?: string;
+  status?: "success" | "partial" | "failed";
+  warnings?: string[];
+  coverage?: {
+    sampled: boolean;
+    requestsMade: number;
+    requestLimit: number;
+    departureDates: string[];
+    searchedFrom: string | null;
+    searchedTo: string | null;
+  };
+  provider?: "kiwi" | "serpapi" | "amadeus" | "skyscanner" | "mixed" | "none";
 };
 
 type SearchParams = {
@@ -83,6 +99,7 @@ type SearchParams = {
   minNights: number;
   maxNights: number;
   selectAirlines: string;
+  nonStopOnly: boolean;
   alertPriceJPY: number;
 };
 
@@ -93,16 +110,18 @@ const DEFAULT_SEARCH: SearchParams = {
   minNights: 3,
   maxNights: 14,
   selectAirlines: "NH",
+  nonStopOnly: true,
   alertPriceJPY: 70000,
 };
 
 const PARAMS_KEY = "track-cheap-flight.search-params.v1";
+const ADMIN_KEY = "track-cheap-flight.admin-session";
 
-function loadStoredParams(): SearchParams {
-  if (typeof window === "undefined") return DEFAULT_SEARCH;
+function loadStoredParams(): SearchParams | null {
+  if (typeof window === "undefined") return null;
   try {
     const raw = window.localStorage.getItem(PARAMS_KEY);
-    if (!raw) return DEFAULT_SEARCH;
+    if (!raw) return null;
     const p = JSON.parse(raw);
     return {
       flyFrom: String(p.flyFrom || DEFAULT_SEARCH.flyFrom).toUpperCase(),
@@ -113,14 +132,15 @@ function loadStoredParams(): SearchParams {
       ),
       minNights: toIntOr(String(p.minNights), DEFAULT_SEARCH.minNights),
       maxNights: toIntOr(String(p.maxNights), DEFAULT_SEARCH.maxNights),
-      selectAirlines: p.selectAirlines || DEFAULT_SEARCH.selectAirlines,
+      selectAirlines: typeof p.selectAirlines === "string" ? p.selectAirlines : DEFAULT_SEARCH.selectAirlines,
+      nonStopOnly: typeof p.nonStopOnly === "boolean" ? p.nonStopOnly : DEFAULT_SEARCH.nonStopOnly,
       alertPriceJPY: toIntOr(
         String(p.alertPriceJPY),
         DEFAULT_SEARCH.alertPriceJPY
       ),
     };
   } catch {
-    return DEFAULT_SEARCH;
+    return null;
   }
 }
 
@@ -198,101 +218,95 @@ export default function HomePage() {
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
   const [sendingTest, setSendingTest] = useState(false);
   const [testMsg, setTestMsg] = useState<string | null>(null);
-  const [params, setParams] = useState<SearchParams>(() => loadStoredParams());
+  const [params, setParams] = useState<SearchParams>(DEFAULT_SEARCH);
   const [paramsLoaded, setParamsLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [adminToken, setAdminToken] = useState("");
+  const loadSequence = useRef(0);
 
   const persistParams = (next: SearchParams) => {
     setParams(next);
     try {
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(PARAMS_KEY, JSON.stringify(next));
-      }
+      window.localStorage.setItem(PARAMS_KEY, JSON.stringify(next));
     } catch {}
   };
 
-  const load = async ({ keepParams = true } = {}) => {
+  const load = useCallback(async (route?: Pick<SearchParams, "flyFrom" | "flyTo" | "nonStopOnly">, initialize = false) => {
+    const sequence = ++loadSequence.current;
     setLoading(true);
+    setLoadError(null);
     try {
-      const r = await fetch("/api/dashboard", { cache: "no-store" });
-      const json = (await r.json()) as DashboardData;
-      setData(json);
-      if (!keepParams || !paramsLoaded) {
-        const fallbackParams = paramsLoaded
-          ? params
-          : {
-              flyFrom: json?.config?.flyFrom || DEFAULT_SEARCH.flyFrom,
-              flyTo: json?.config?.flyTo || DEFAULT_SEARCH.flyTo,
-              searchDaysAhead:
-                json?.config?.searchDaysAhead || DEFAULT_SEARCH.searchDaysAhead,
-              minNights: json?.config?.minNights ?? DEFAULT_SEARCH.minNights,
-              maxNights: json?.config?.maxNights ?? DEFAULT_SEARCH.maxNights,
-              selectAirlines:
-                (json?.config?.selectAirlines || []).join(",") ||
-                DEFAULT_SEARCH.selectAirlines,
-              alertPriceJPY:
-                json?.config?.alertPrice || DEFAULT_SEARCH.alertPriceJPY,
-            };
-        if (!paramsLoaded) {
-          setParams(fallbackParams);
-          setParamsLoaded(true);
+      const query = route ? `?${new URLSearchParams({ flyFrom: route.flyFrom.trim().toUpperCase(), flyTo: route.flyTo.trim().toUpperCase(), nonStopOnly: String(route.nonStopOnly) })}` : "";
+      const response = await fetch(`/api/dashboard${query}`, { cache: "no-store" });
+      const json = await response.json() as DashboardData;
+      if (sequence !== loadSequence.current) return;
+      if (json.config && Array.isArray(json.recentFlights)) {
+        setData(json);
+        if (initialize) {
+          setParams({
+            flyFrom: json.config.flyFrom,
+            flyTo: json.config.flyTo,
+            searchDaysAhead: json.config.searchDaysAhead,
+            minNights: json.config.minNights,
+            maxNights: json.config.maxNights,
+            selectAirlines: json.config.selectAirlines.join(","),
+            nonStopOnly: json.config.nonStopOnly,
+            alertPriceJPY: json.config.alertPrice,
+          });
         }
+      } else {
+        setData(null);
       }
+      if (!response.ok || json.error) throw new Error(json.error || "履歴を読み込めませんでした。");
+    } catch (error) {
+      if (sequence === loadSequence.current) setLoadError(error instanceof Error ? error.message : "履歴を読み込めませんでした。");
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current) {
+        setLoading(false);
+        setParamsLoaded(true);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    load({ keepParams: false });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const stored = loadStoredParams();
+    if (stored) setParams(stored);
+    try { setAdminToken(window.sessionStorage.getItem(ADMIN_KEY) || ""); } catch {}
+    void load(stored ?? undefined, !stored);
+    return () => { loadSequence.current += 1; };
+  }, [load]);
+
+  const credentials = () => {
+    try {
+      if (adminToken.trim()) window.sessionStorage.setItem(ADMIN_KEY, adminToken.trim());
+      else window.sessionStorage.removeItem(ADMIN_KEY);
+    } catch {}
+    return { Authorization: `Bearer ${adminToken.trim()}` };
+  };
 
   const runSearch = async () => {
     setSearching(true);
     setSearchResult(null);
     const originalParams = { ...params };
     try {
-      const r = await fetch("/api/search", {
+      const response = await fetch("/api/search", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          flyFrom: originalParams.flyFrom.trim().toUpperCase(),
-          flyTo: originalParams.flyTo.trim().toUpperCase(),
-          searchDaysAhead: toIntOr(
-            String(originalParams.searchDaysAhead),
-            DEFAULT_SEARCH.searchDaysAhead
-          ),
-          minNights: toIntOr(
-            String(originalParams.minNights),
-            DEFAULT_SEARCH.minNights
-          ),
-          maxNights: toIntOr(
-            String(originalParams.maxNights),
-            DEFAULT_SEARCH.maxNights
-          ),
-          selectAirlines: originalParams.selectAirlines,
-          alertPriceJPY: toIntOr(
-            String(originalParams.alertPriceJPY),
-            DEFAULT_SEARCH.alertPriceJPY
-          ),
-        }),
+        headers: { "Content-Type": "application/json", ...credentials() },
+        body: JSON.stringify({ ...originalParams, flyFrom: originalParams.flyFrom.trim().toUpperCase(), flyTo: originalParams.flyTo.trim().toUpperCase() }),
       });
-      const json = (await r.json()) as SearchResult;
+      const json = await response.json() as SearchResult;
+      if (!response.ok && json.flightsFound == null) throw new Error(json.error || "検索できませんでした。");
       setSearchResult(json);
-      await load({ keepParams: true });
-      persistParams(originalParams);
-    } catch (e) {
+      await load(originalParams);
+    } catch (error) {
       setSearchResult({
         success: false,
-        error: e instanceof Error ? e.message : String(e),
-        flightsFound: 0,
-        minPrice: null,
-        isNewLowest: false,
-        previousLowest: null,
-        emailSent: false,
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+        flightsFound: 0, minPrice: null, isNewLowest: false,
+        previousLowest: null, emailSent: false,
       });
     } finally {
-      persistParams(originalParams);
       setSearching(false);
     }
   };
@@ -301,19 +315,11 @@ export default function HomePage() {
     setSendingTest(true);
     setTestMsg(null);
     try {
-      const r = await fetch("/api/test-email", { method: "POST" });
-      const json = (await r.json()) as {
-        success: boolean;
-        error?: string;
-        sentTo?: string;
-      };
-      if (json.success) {
-        setTestMsg(`✅ テストメール送信完了 → ${json.sentTo}`);
-      } else {
-        setTestMsg(`❌ 送信失敗: ${json.error || "不明なエラー"}`);
-      }
-    } catch (e) {
-      setTestMsg(`❌ エラー: ${e instanceof Error ? e.message : String(e)}`);
+      const response = await fetch("/api/test-email", { method: "POST", headers: credentials() });
+      const json = await response.json() as { success: boolean; error?: string };
+      setTestMsg(json.success ? "✅ 設定済みの宛先へテストメールを送信しました。" : `❌ 送信失敗: ${json.error || "不明なエラー"}`);
+    } catch (error) {
+      setTestMsg(`❌ エラー: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setSendingTest(false);
     }
@@ -323,7 +329,7 @@ export default function HomePage() {
     if (!data) return [] as FlightRecord[];
     const seen = new Map<string, FlightRecord>();
     for (const f of data.recentFlights) {
-      const k = `${f.departure_at.slice(0, 10)}|${f.return_at.slice(
+      const k = `${f.fly_from}|${f.fly_to}|${f.departure_at.slice(0, 10)}|${f.return_at.slice(
         0,
         10
       )}|${f.airline}`;
@@ -335,6 +341,9 @@ export default function HomePage() {
       .slice(0, 15);
   }, [data]);
 
+  const displayedRoute = data?.selectedRoute ?? data?.config;
+  const displayedFlightScope = (displayedRoute?.nonStopOnly ?? params.nonStopOnly) ? "直行便のみ" : "乗り継ぎ便を含む";
+
   const historyMax = useMemo(() => {
     if (!data || data.priceHistory.length === 0) return 0;
     return Math.max(...data.priceHistory.map((p) => p.min_price));
@@ -343,8 +352,10 @@ export default function HomePage() {
   const update = (key: keyof SearchParams) => (
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
   ) => {
-    const next = { ...params, [key]: e.target.value };
+    const numeric = ["searchDaysAhead", "minNights", "maxNights", "alertPriceJPY"].includes(key);
+    const next = { ...params, [key]: numeric ? Number(e.target.value) : e.target.value };
     persistParams(next);
+    setSearchResult(null);
   };
 
   return (
@@ -354,20 +365,31 @@ export default function HomePage() {
           ✈️ んぽ
         </div>
         <h1 className="text-3xl md:text-4xl font-black tracking-tight text-primary-800">
-          東京 ⇔ 大連 最安値トラッカー
+          往復航空券の価格トラッカー
         </h1>
         <p className="mt-3 text-primary-700/80">
-          自動で毎日検索 → 過去最安値 or 設定価格以下になったらメールでお知らせ
-          💌
+          日程を分散して定期検索。見つかった低価格をメールでお知らせ 💌
         </p>
       </header>
+
+      {loadError && <div role="alert" className="mb-6 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800">履歴の読み込みに問題があります: {loadError}</div>}
+      <details className="npo-card p-4 mb-6" open>
+        <summary className="cursor-pointer font-bold text-primary-800">管理アクセス</summary>
+        <label htmlFor="admin-token" className="mt-3 block text-sm text-primary-900">管理キー</label>
+        <div className="mt-2 flex flex-wrap gap-3 items-center">
+          <input id="admin-token" type="password" value={adminToken} autoComplete="off" onChange={e => setAdminToken(e.target.value)} className="min-w-0 flex-1 rounded-lg border border-amber-300 bg-white px-3 py-2" placeholder="管理キーを入力" />
+          <button type="button" className="text-sm text-primary-800 underline" onClick={() => { setAdminToken(""); try { window.sessionStorage.removeItem(ADMIN_KEY); } catch {} }}>クリア</button>
+        </div>
+        <p className="mt-2 text-xs text-primary-700">検索・メール送信には管理キーが必要です。操作時にこのタブのセッションだけに保存します。</p>
+        {data?.config.adminConfigured === false && <p className="mt-2 text-sm text-rose-700">管理アクセスが未設定です。サイト管理者による設定が必要です。</p>}
+      </details>
 
       <section className="npo-card p-6 md:p-8 mb-8">
         <div className="grid md:grid-cols-2 gap-6 items-start">
           <div>
             <div className="flex items-center gap-2 mb-2">
               <span className="npo-tag bg-amber-100 text-amber-800">
-                🏆 現在の歴代最安値
+                🏆 {displayedRoute?.flyFrom || "—"} ⇔ {displayedRoute?.flyTo || "—"} の過去最安値
               </span>
               {data?.latestLowest && (
                 <span className="npo-tag bg-emerald-100 text-emerald-800">
@@ -375,6 +397,7 @@ export default function HomePage() {
                 </span>
               )}
             </div>
+            <p className="mt-2 text-xs text-primary-700">全航空会社・{displayedFlightScope}の過去の検索結果です。現在の空席・価格は予約先でご確認ください。</p>
             {data?.latestLowest ? (
               <div>
                 <div className="text-5xl md:text-6xl font-black text-primary-700 leading-none my-4">
@@ -400,29 +423,29 @@ export default function HomePage() {
                     rel="noreferrer"
                     className="npo-btn inline-block mt-5 text-base"
                   >
-                    👉 ANA / Googleで予約する
+                    👉 予約先で最新の価格を確認
                   </a>
                 )}
               </div>
             ) : (
               <div className="text-2xl font-bold text-primary-700/50 my-6">
-                まだデータがありません。下のボタンで今すぐ検索！
+                {loading ? "履歴を読み込み中..." : loadError ? "履歴を表示できません。上の案内をご確認ください。" : "まだ記録がありません。条件を選んで検索してください。"}
               </div>
             )}
           </div>
 
           <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-3 text-sm">
+            <fieldset disabled={searching || !paramsLoaded} className="grid grid-cols-2 gap-3 text-sm">
               <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
                 <label className="block text-xs text-amber-700 mb-1">
-                  🛫 出発（空港コード
+                  🛫 出発（都市・空港コード）
                 </label>
                 <input
                   type="text"
                   value={params.flyFrom}
                   onChange={update("flyFrom")}
                   className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold uppercase"
-                  placeholder="TYO / NRT HND"
+                  placeholder="例 TYO / NRT / HND"
                 />
               </div>
               <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
@@ -434,7 +457,7 @@ export default function HomePage() {
                   value={params.flyTo}
                   onChange={update("flyTo")}
                   className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold uppercase"
-                  placeholder="DLC / DLC → 大連周子水子"
+                  placeholder="例 DLC（大連）"
                 />
               </div>
               <div className="p-3 rounded-xl bg-amber-50 border border-amber-200">
@@ -443,7 +466,7 @@ export default function HomePage() {
                 </label>
                 <input
                   type="number"
-                  min={7}
+                  min={1}
                   max={365}
                   step={1}
                   value={params.searchDaysAhead}
@@ -459,7 +482,7 @@ export default function HomePage() {
                   <input
                     type="number"
                     min={0}
-                    max={365}
+                    max={90}
                     step={1}
                     value={params.minNights}
                     onChange={update("minNights")}
@@ -469,7 +492,7 @@ export default function HomePage() {
                   <input
                     type="number"
                     min={0}
-                    max={365}
+                    max={90}
                     step={1}
                     value={params.maxNights}
                     onChange={update("maxNights")}
@@ -506,26 +529,47 @@ export default function HomePage() {
                 </label>
                 <input
                   type="number"
-                  min={0}
+                  min={1}
+                  max={10000000}
                   step={1000}
                   value={params.alertPriceJPY}
                   onChange={update("alertPriceJPY")}
                   className="w-full bg-white rounded-lg px-2 py-1.5 border border-amber-300 focus:outline-none focus:border-orange-400 text-amber-900 font-bold"
                 />
               </div>
-            </div>
+              <label className="col-span-2 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3">
+                <input
+                  type="checkbox"
+                  checked={params.nonStopOnly}
+                  onChange={event => {
+                    const next = { ...params, nonStopOnly: event.target.checked };
+                    persistParams(next);
+                    setSearchResult(null);
+                    setData(null);
+                    void load(next);
+                  }}
+                  className="mt-1 h-4 w-4 shrink-0 accent-orange-500"
+                />
+                <span className="text-sm text-amber-900">
+                  <span className="block font-bold">直行便のみ（乗り継ぎなし）</span>
+                  <span className="mt-1 block text-xs text-amber-800">往路・復路の両方が直行便の候補だけを検索・表示します。直行便と確認できない過去の記録も除外します。</span>
+                </span>
+              </label>
+            </fieldset>
+            <p className="text-xs text-primary-700">この条件は手動検索用です。毎日の自動検索条件はサイトの設定を使用します。日程は範囲内で抽出するため、全日程の最安値を保証するものではありません。</p>
+            <button type="button" disabled={loading || searching || !/^[A-Z]{3}$/i.test(params.flyFrom.trim()) || !/^[A-Z]{3}$/i.test(params.flyTo.trim())} onClick={() => void load(params)} className="text-sm underline text-primary-800">この路線の履歴を表示</button>
 
             <div className="flex flex-wrap gap-3">
               <button
                 onClick={runSearch}
-                disabled={searching}
+                disabled={searching || !paramsLoaded || !adminToken.trim() || data?.config.adminConfigured === false || data?.storage?.configured === false}
                 className="npo-btn flex-1"
               >
                 {searching ? "🔍 検索中..." : "🔍 今すぐ検索する"}
               </button>
               <button
                 onClick={sendTestEmail}
-                disabled={sendingTest || !data?.config.emailEnabled}
+                disabled={sendingTest || !adminToken.trim() || !data?.config.emailEnabled || data?.config.adminConfigured === false}
                 className="npo-btn flex-1 !bg-gradient-to-r !from-pink-400 !to-rose-500 !shadow-rose-300/60"
               >
                 {sendingTest ? "💌 送信中..." : "💌 テストメール送信"}
@@ -533,7 +577,7 @@ export default function HomePage() {
             </div>
             {!data?.config.emailEnabled && (
               <p className="text-xs text-rose-600">
-                ⚠ .env で EMAIL_ENABLED=true にし、SMTP設定をするとメール通知が有効になります
+                メール通知は未設定です。検索結果はこの画面で確認できます。
               </p>
             )}
             {testMsg && (
@@ -553,10 +597,12 @@ export default function HomePage() {
                 </div>
                 <div>
                   ステータス:{" "}
-                  {searchResult.success
-                    ? "✅ 成功"
+                  {searchResult.status === "partial" ? "⚠ 一部の結果を保存しました" : searchResult.success
+                    ? "✅ 検索完了"
                     : `⚠ ${searchResult.error || "失敗"}`}
                 </div>
+                {searchResult.coverage && <div className="text-xs text-primary-700">調査した出発日: {searchResult.coverage.departureDates.length} 日分 / 検索リクエスト: {searchResult.coverage.requestsMade} 回（上限 {searchResult.coverage.requestLimit} 回）。全日程の網羅検索ではありません。</div>}
+                {!!searchResult.warnings?.length && <ul className="list-disc pl-5 text-xs text-amber-800">{searchResult.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
                 <div>発見件数: {searchResult.flightsFound} 件</div>
                 <div>最安値: {fmtJPY(searchResult.minPrice)}</div>
                 <div>
@@ -568,7 +614,7 @@ export default function HomePage() {
                 </div>
                 <div>
                   メール送信:{" "}
-                  {searchResult.emailSent ? "📬 送信済み" : "スキップ"}
+                  {searchResult.emailError ? `⚠ ${searchResult.emailError}` : searchResult.emailSent ? "📬 送信済み" : "送信なし（通知条件・重複確認により判定）"}
                 </div>
               </div>
             )}
@@ -578,7 +624,7 @@ export default function HomePage() {
 
       <section className="npo-card p-6 mb-8">
         <h2 className="text-xl font-bold text-primary-800 mb-4 flex items-center gap-2">
-          📈 30日間の価格推移
+          📈 {displayedRoute?.flyFrom || "—"} ⇔ {displayedRoute?.flyTo || "—"} 30日間の発見価格（全航空会社・{displayedFlightScope}）
         </h2>
         {data && data.priceHistory.length > 0 ? (
           <div>
@@ -624,11 +670,10 @@ export default function HomePage() {
 
       <section className="npo-card p-6 mb-8">
         <h2 className="text-xl font-bold text-primary-800 mb-4 flex items-center gap-2">
-          🔥 最近の格安往復（上位15件）
+          🔥 最近の格安往復（{displayedFlightScope}・上位15件）
         </h2>
         <p className="text-xs text-primary-700/70 mb-3">
-          取得できた航段の航空会社を表示しています。復路・運航会社は予約画面でご確認ください。
-          指定した航空会社の候補が少ない場合、他社の候補も含みます。
+          表示中の路線で過去に見つかった候補です。現在の検索条件とは異なる記録も含みます。日付のみの表示は検索対象日を示します。便の時刻・空席・運航会社は予約先でご確認ください。
         </p>
         {uniqueRoutes.length > 0 ? (
           <div className="overflow-x-auto -mx-2">
@@ -697,7 +742,7 @@ export default function HomePage() {
 
       <section className="npo-card p-6 mb-8">
         <h2 className="text-xl font-bold text-primary-800 mb-4 flex items-center gap-2">
-          ⏱ 検索実行履歴（直近20回）
+          ⏱ 検索実行履歴（全路線・全条件・直近20回）
         </h2>
         {data?.searchRuns && data.searchRuns.length > 0 ? (
           <div className="overflow-x-auto -mx-2">
@@ -750,14 +795,13 @@ export default function HomePage() {
           <code className="bg-amber-100 px-2 py-0.5 rounded">
             {data?.config.cronSchedule}
           </code>
-          （タイムゾーン: {data?.config.cronTimezone}） | Vercel へデプロイ時は
-          vercel.json の schedule も参照
+          （タイムゾーン: {data?.config.cronTimezone || "—"}）{data?.config.cronTimezone === "UTC" && " · 0 0 * * * は日本時間の毎日9時"}
         </p>
       </section>
 
       <footer className="text-center text-xs text-primary-700/50 py-6">
         Made with 💛 for んぽちゃむ　|　データは SerpAPI (Google
-        Flights) + Kiwi.com (Tequila) より取得
+        Flights) ほか設定済みの検索サービスより取得
       </footer>
     </main>
   );
